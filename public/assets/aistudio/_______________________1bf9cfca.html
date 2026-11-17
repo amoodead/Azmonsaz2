@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>آزمون‌ساز | هفتم تا نهم</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Lalezar&family=Vazirmatn:wght@300;500;800;900&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#000;--s1:#0e0e0e;--s2:#1a1a1a;--line:#2e2e2e;--mut:#8a8a8a;--tx:#e6e6e6;--hi:#fff;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{scroll-padding-top:env(safe-area-inset-top,0px);height:100%}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--tx);font-family:'Vazirmatn',Tahoma,sans-serif;overflow-x:hidden;line-height:1.9}
+.wheel{display:block}
+.panel{min-height:100vh;display:flex;flex-direction:column;justify-content:center;padding:12vh 7vw;will-change:transform,opacity;backface-visibility:hidden;border-bottom:1px solid var(--line)}
+.panel.tall{min-height:auto}
+h1{font-family:'Lalezar','Vazirmatn',Tahoma,sans-serif;font-weight:400;font-size:clamp(4.2rem,18vw,12.5rem);line-height:1.2;background:linear-gradient(180deg,#fff 15%,#5e5e5e 100%);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;color:transparent}
+h1 span{display:block;font-size:.45em;line-height:1.3;background:none;-webkit-text-fill-color:#555;color:#555}
+h2{font-family:'Lalezar','Vazirmatn',Tahoma,sans-serif;font-weight:400;font-size:clamp(2.4rem,7vw,4.6rem);line-height:1.3;color:var(--hi);margin-bottom:1.2rem}
+.row b,.steps b{font-family:'Lalezar','Vazirmatn',Tahoma,sans-serif;font-weight:400;font-size:1.35rem}
+p.lead{max-width:34rem;color:var(--mut);font-size:1.1rem;margin-top:1.8rem}
+.hint{margin-top:3rem;color:var(--mut);font-size:.9rem;display:flex;align-items:center;gap:.7rem}
+.hint i{width:1px;height:42px;background:linear-gradient(var(--hi),transparent)}
+.rows{max-width:46rem}
+.row{display:flex;gap:1.5rem;padding:1.4rem 0;border-top:1px solid var(--line)}
+.row:last-child{border-bottom:1px solid var(--line)}
+.row b{min-width:9rem;color:var(--hi);font-weight:500}
+.row span{color:var(--mut)}
+.steps{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0;max-width:60rem;border:1px solid var(--line)}
+.steps div{padding:1.6rem;border-inline-start:1px solid var(--line);background:var(--s1)}
+.steps div:first-child{border-inline-start:0}
+.steps b{display:block;color:var(--hi);margin-bottom:.3rem}
+.steps span{color:var(--mut);font-size:.95rem}
+/* builder */
+.builder{background:linear-gradient(#000,#0b0b0b)}
+.box{max-width:62rem;background:var(--s1);border:1px solid var(--line);border-radius:6px;padding:clamp(1.2rem,4vw,2.5rem)}
+.f{margin-bottom:1.6rem}
+.f>label{display:block;color:var(--mut);font-size:.9rem;margin-bottom:.6rem}
+.chips{display:flex;flex-wrap:wrap;gap:.5rem}
+.chip{font:inherit;color:var(--tx);background:var(--s2);border:1px solid var(--line);padding:.45rem 1.1rem;border-radius:999px;cursor:pointer;transition:.15s}
+.chip:hover{border-color:#666}
+.chip[aria-pressed=true]{background:var(--hi);color:#000;border-color:var(--hi);font-weight:500}
+.chip:focus-visible,.go:focus-visible,select:focus-visible{outline:2px solid var(--hi);outline-offset:2px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:1.2rem}
+select{font:inherit;width:100%;background:var(--s2);color:var(--tx);border:1px solid var(--line);padding:.6rem .8rem;border-radius:6px}
+.go{font:inherit;font-weight:800;font-size:1.1rem;width:100%;padding:1rem;background:var(--hi);color:#000;border:0;border-radius:6px;cursor:pointer;transition:transform .15s}
+.go:active{transform:scale(.99)}
+.sheet{margin-top:2rem;background:#ededed;color:#111;border-radius:6px;padding:clamp(1.2rem,4vw,2.5rem);max-width:62rem}
+.sheet header{display:flex;flex-wrap:wrap;justify-content:space-between;gap:.5rem;border-bottom:2px solid #111;padding-bottom:.8rem;margin-bottom:1.2rem;font-weight:500}
+.sheet ol{padding-inline-start:1.5rem}
+.sheet li{margin-bottom:1.1rem}
+.sheet .note{color:#666;font-size:.85rem}
+.tools{display:flex;gap:.6rem;margin-top:1rem}
+.tools button{font:inherit;background:#111;color:#fff;border:0;padding:.5rem 1.2rem;border-radius:6px;cursor:pointer}
+footer{padding:3rem 7vw;color:var(--mut);font-size:.85rem}
+@media(max-width:640px){.two{grid-template-columns:1fr}.row{flex-direction:column;gap:.2rem}}
+@media print{body *{visibility:hidden}.sheet,.sheet *{visibility:visible}.sheet{position:absolute;inset:0;margin:0}.tools{display:none}}
+@media(prefers-reduced-motion:reduce){.panel{transform:none!important;opacity:1!important}}
+</style>
+</head>
+<body>
+<div class="wheel" id="wheel">
+  <section class="panel" id="top">
+    <h1>آزمون‌ساز<span>هفتم تا نهم</span></h1>
+    <p class="lead">درس و فصل را انتخاب کن، تعداد سؤال را مشخص کن و در چند ثانیه برگه‌ی آزمون آماده‌ی خودت را داشته باش.</p>
+    <div class="hint"><i></i>اسکرول کن</div>
+  </section>
+
+  <section class="panel">
+    <h2>مخصوص دانش‌آموز</h2>
+    <div class="rows">
+      <div class="row"><b>سه پایه</b><span>سؤال‌ها بر اساس کتاب‌های هفتم، هشتم و نهم دسته‌بندی شده‌اند.</span></div>
+      <div class="row"><b>انتخاب فصل</b><span>فقط فصل‌هایی را که خوانده‌ای انتخاب کن؛ یک فصل، چند فصل یا همه.</span></div>
+      <div class="row"><b>سطح دلخواه</b><span>از آسان تا چالشی؛ مدت آزمون را هم خودت تعیین می‌کنی.</span></div>
+      <div class="row"><b>چاپ و حل</b><span>برگه را چاپ کن یا روی صفحه حل کن، بعد دوباره آزمون جدید بساز.</span></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>سه قدم تا آزمون</h2>
+    <div class="steps">
+      <div><b>پایه و درس</b><span>هفتم، هشتم یا نهم و درس موردنظر</span></div>
+      <div><b>فصل‌ها</b><span>یک یا چند فصل برای مرور</span></div>
+      <div><b>تنظیمات</b><span>تعداد سؤال، سطح و زمان</span></div>
+    </div>
+  </section>
+
+  <section class="panel builder tall" id="builder">
+    <h2>ساخت آزمون</h2>
+    <div class="box">
+      <div class="f"><label>پایه</label><div class="chips" id="grade"></div></div>
+      <div class="f"><label>درس</label><div class="chips" id="subject"></div></div>
+      <div class="f"><label>فصل‌ها (می‌توانی چند فصل انتخاب کنی)</label><div class="chips" id="chapters"></div></div>
+      <div class="two f">
+        <div><label style="color:var(--mut);font-size:.9rem">تعداد سؤال</label>
+          <select id="count"><option>5</option><option selected>10</option><option>15</option><option>20</option></select></div>
+        <div><label style="color:var(--mut);font-size:.9rem">زمان آزمون</label>
+          <select id="time"><option value="15">۱۵ دقیقه</option><option value="30" selected>۳۰ دقیقه</option><option value="45">۴۵ دقیقه</option><option value="60">۶۰ دقیقه</option></select></div>
+      </div>
+      <div class="f"><label>سطح</label><div class="chips" id="level"></div></div>
+      <button class="go" id="make">بساز آزمون</button>
+    </div>
+    <div class="sheet" id="sheet" hidden></div>
+  </section>
+  <footer>آزمون‌ساز — نسخه‌ی نمونه. بانک سؤال را می‌توان کامل‌تر کرد.</footer>
+</div>
+
+<script>
+const fa=n=>Number(n).toLocaleString('fa-IR');
+const GR=['هفتم','هشتم','نهم'];
+const SUB={'ریاضی':9,'علوم':14,'فارسی':18,'عربی':8,'اجتماعی':19,'انگلیسی':8};
+const LV=['آسان','متوسط','چالشی'];
+const st={g:0,s:'ریاضی',ch:new Set([1]),l:1};
+const R=(a,b)=>Math.floor(Math.random()*(b-a+1))+a;
+const shuf=a=>a.map(x=>[Math.random(),x]).sort((p,q)=>p[0]-q[0]).map(x=>x[1]);
+
+const BANK={
+'علوم':[
+ 'تفاوت ماده‌ی خالص و مخلوط را با یک مثال توضیح بده.',
+ 'سه حالت ماده را نام ببر و برای هر کدام یک مثال بزن.',
+ 'سلول چیست و چرا آن را واحد ساختار جانداران می‌نامند؟',
+ 'تفاوت تغییر فیزیکی و تغییر شیمیایی را بنویس.',
+ 'نیرو چیست و با چه یکایی اندازه‌گیری می‌شود؟',
+ 'یک زنجیره‌ی غذایی سه‌حلقه‌ای بنویس و تولیدکننده را مشخص کن.',
+ 'چرا هنگام گرم شدن، حجم بیشتر مواد افزایش می‌یابد؟',
+ 'دو روش برای جداسازی اجزای یک مخلوط را با مثال شرح بده.'],
+'فارسی':[
+ 'مفهوم کلی یک شعر یا متن درسی را که خوانده‌ای در دو سطر بنویس.',
+ 'سه واژه‌ی هم‌خانواده با واژه‌ی «دانش» بنویس.',
+ 'در جمله‌ی «کودک کتاب را خواند.» نهاد، مفعول و فعل را مشخص کن.',
+ 'دو جمله با کاربرد «ی» نکره بنویس.',
+ 'تفاوت جمله‌ی خبری و پرسشی را با مثال بنویس.',
+ 'برای واژه‌ی «روشن» یک متضاد و یک مترادف بنویس.',
+ 'یک بند کوتاه درباره‌ی «ارزش وقت» بنویس.'],
+'عربی':[
+ 'کلمه‌ی «کتاب» را ترجمه کن و جمع آن را بنویس.',
+ 'فعل ماضی و مضارع «ذهب» را بنویس.',
+ 'جمله‌ی «ذَهَبَ الطالبُ إلى المدرسة» را ترجمه کن.'],
+'اجتماعی':[
+ 'یک مورد از ویژگی‌های جغرافیایی کشور خودت را بنویس.',
+ 'تفاوت حقوق و وظایف شهروندی را با مثال بنویس.',
+ 'چرا حفظ آثار تاریخی مهم است؟ دو دلیل بنویس.'],
+'انگلیسی':[
+ 'Write a sentence using the word "because".',
+ 'Change to plural: child, box, city.',
+ 'Answer: What do you do in your free time?']
+};
+const MATH=[
+ l=>{const a=R(2,9)*(l+1),b=R(2,12),c=R(2,9);return `حاصل عبارت را به دست بیاور: ${fa(a)} + ${fa(b)} × ${fa(c)}`},
+ l=>{const x=R(2,12),a=R(2,6)+l,b=R(1,20);return `معادله را حل کن: ${fa(a)}x + ${fa(b)} = ${fa(a*x+b)}`},
+ l=>{const a=R(1,5),b=R(2,9),c=R(1,5);return `حاصل را به صورت ساده‌شده بنویس: ${fa(a)}/${fa(b)} + ${fa(c)}/${fa(b)}`},
+ l=>{const w=R(3,12)+l*3,h=R(2,9)+l*2;return `مساحت و محیط مستطیلی به طول ${fa(w)} و عرض ${fa(h)} سانتی‌متر را بنویس.`},
+ l=>{const p=[10,20,25,50][R(0,3)],n=R(2,20)*10*(l+1);return `${fa(p)} درصد عدد ${fa(n)} چقدر است؟`},
+ l=>{const a=R(2,6),b=R(2,6);return `عبارت جبری را ساده کن: ${fa(a)}x + ${fa(b)}y − ${fa(a-1||1)}x + ${fa(b)}y`},
+ l=>{const a=R(-9,-2),b=R(-9,9);return `حاصل را به دست بیاور: (${fa(a)}) × (${fa(b)}) − (${fa(R(1,9))})`},
+ l=>{const s=R(3,10)+l*2;return `مکعبی به ضلع ${fa(s)} سانتی‌متر دارد. حجم آن چند سانتی‌متر مکعب است؟`}
+];
+
+function chips(id,items,cur,fn,multi){
+  const el=document.getElementById(id);el.innerHTML='';
+  items.forEach(([v,t])=>{
+    const b=document.createElement('button');b.className='chip';b.textContent=t;
+    b.setAttribute('aria-pressed',cur(v));
+    b.onclick=()=>{fn(v);render()};el.appendChild(b);
+  });
+}
+function render(){
+  chips('grade',GR.map((t,i)=>[i,'پایه‌ی '+t]),v=>v===st.g,v=>st.g=v);
+  chips('subject',Object.keys(SUB).map(k=>[k,k]),v=>v===st.s,v=>{st.s=v;st.ch=new Set([1])});
+  const n=SUB[st.s];
+  chips('chapters',[['all','همه'],...Array.from({length:n},(_,i)=>[i+1,'فصل '+fa(i+1)])],
+    v=>v==='all'?st.ch.size===n:st.ch.has(v),
+    v=>{if(v==='all'){st.ch=st.ch.size===n?new Set([1]):new Set(Array.from({length:n},(_,i)=>i+1))}
+        else{st.ch.has(v)?(st.ch.size>1&&st.ch.delete(v)):st.ch.add(v)}});
+  chips('level',LV.map((t,i)=>[i,t]),v=>v===st.l,v=>st.l=v);
+}
+document.getElementById('make').onclick=()=>{
+  const n=+document.getElementById('count').value,t=document.getElementById('time').value;
+  let qs=[];
+  if(st.s==='ریاضی'){for(let i=0;i<n;i++)qs.push(MATH[i%MATH.length](st.l))}
+  else{const b=shuf(BANK[st.s]);for(let i=0;i<n;i++)qs.push(b[i%b.length])}
+  if(st.s==='ریاضی')qs=shuf(qs);
+  const chs=[...st.ch].sort((a,b)=>a-b).map(fa).join('، ');
+  const el=document.getElementById('sheet');
+  el.hidden=false;
+  el.innerHTML=`<header><span>آزمون ${st.s} — پایه‌ی ${GR[st.g]}</span><span>فصل‌ها: ${chs}</span><span>سطح: ${LV[st.l]}</span><span>زمان: ${fa(t)} دقیقه</span></header>
+  <ol>${qs.map(q=>`<li>${q}</li>`).join('')}</ol>
+  ${BANK[st.s]&&st.s!=='ریاضی'?'<p class="note">این سؤال‌ها نمونه‌اند و هنوز بر اساس فصل فیلتر نمی‌شوند.</p>':''}
+  <div class="tools"><button onclick="window.print()">چاپ</button><button onclick="document.getElementById('make').click()">آزمون جدید</button></div>`;
+  el.scrollIntoView({behavior:'smooth',block:'start'});
+};
+render();
+
+/* roller / drum scroll effect */
+const panels=[...document.querySelectorAll('.panel')];
+const calm=matchMedia('(prefers-reduced-motion:reduce)').matches;
+/* true cylinder: each panel sits on the drum surface, rotating around an axis at the viewport centre; scroll is eased for a silky feel */
+let cur=scrollY,raf=0;
+function roll(){
+  raf=0;if(calm)return;
+  const y=scrollY;
+  cur+=(y-cur)*.12;
+  if(Math.abs(y-cur)<.4)cur=y;
+  const mid=innerHeight/2,rad=innerHeight*.95,dy=y-cur;
+  panels.forEach(p=>{
+    const h=p.offsetHeight,vt=p.offsetTop-cur;
+    if(h>innerHeight*1.4){p.style.transform=`translateY(${dy}px)`;p.style.opacity='';return}
+    const off=vt+h/2-mid;
+    const th=Math.max(-1.45,Math.min(1.45,off/rad));
+    p.style.transformOrigin=`50% ${mid-vt}px`;
+    p.style.transform=`translateY(${dy}px) perspective(1600px) translateZ(${-rad}px) rotateX(${-th}rad) translateZ(${rad}px) translateY(${-off}px)`;
+    p.style.opacity=Math.max(0,1-Math.pow(Math.abs(th)/1.3,2.2)).toFixed(3);
+  });
+  if(cur!==y)raf=requestAnimationFrame(roll);
+}
+const kick=()=>{if(!raf)raf=requestAnimationFrame(roll)};
+addEventListener('scroll',kick,{passive:true});
+addEventListener('resize',kick);
+if(document.fonts)document.fonts.ready.then(kick);
+roll();
+</script>
+</body>
+</html>

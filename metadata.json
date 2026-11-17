@@ -1,0 +1,6 @@
+{
+  "name": "آزمونا | آزمون‌ساز هوشمند دوره اول متوسطه",
+  "description": "پلتفرم هوشمند طراحی آزمون چهارگزینه‌ای و تحلیل تشریحی خطاها ویژه دانش‌آموزان پایه هفتم، هشتم و نهم",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

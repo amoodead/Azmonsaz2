@@ -14,9 +14,7 @@
 @layer base {
   html {
     font-family: "Vazirmatn", Tahoma, sans-serif;
-    scroll-padding-top: 72px;
-    overflow-x: clip;
-    max-width: 100%;
+    scroll-padding-top: 68px;
     scrollbar-width: none;
     -ms-overflow-style: none;
   }
@@ -32,11 +30,10 @@
     background: var(--bg);
     color: var(--tx);
     font-family: "Vazirmatn", Tahoma, sans-serif;
-    overflow-x: clip;
-    max-width: 100%;
     line-height: 1.9;
     padding-top: env(safe-area-inset-top, 0px);
     padding-bottom: env(safe-area-inset-bottom, 0px);
+    -webkit-tap-highlight-color: transparent;
   }
 
   .exam-live-protected {
@@ -57,6 +54,11 @@
   a[href] {
     cursor: pointer;
   }
+}
+
+.wheel {
+  overflow-x: clip;
+  width: 100%;
 }
 
 .font-display {
@@ -100,9 +102,14 @@
   flex-direction: column;
   justify-content: center;
   padding: 9vh 6vw;
-  will-change: transform, opacity;
-  backface-visibility: hidden;
   border-bottom: 1px solid var(--line);
+}
+
+@media (min-width: 768px) and (hover: hover) {
+  .panel {
+    will-change: transform, opacity;
+    backface-visibility: hidden;
+  }
 }
 
 .panel.tall {
@@ -112,14 +119,15 @@
 @media (max-width: 767px) {
   .panel {
     min-height: auto;
-    padding: 3.25rem 1.125rem;
+    padding: 2.5rem 1rem;
     transform: none !important;
     opacity: 1 !important;
+    will-change: auto;
   }
   .panel.hero-panel {
-    min-height: calc(88svh - 60px);
-    padding-top: 2.5rem;
-    padding-bottom: 3rem;
+    min-height: auto;
+    padding-top: 2.75rem;
+    padding-bottom: 2.75rem;
   }
 }
 

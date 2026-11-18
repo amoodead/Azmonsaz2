@@ -193,28 +193,34 @@ export default function App() {
     }
   }, [history, authUser]);
 
-  // Desktop-only 3D drum-roller effect (disabled on mobile <= 767px for clean native scrolling)
+  // Desktop-only 3D drum-roller effect (zero scroll JS attached on mobile/touch devices)
   useEffect(() => {
     const wheel = wheelRef.current;
     if (!wheel) return;
 
-    const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    if (calm) return;
-
+    const desktopMedia = window.matchMedia('(min-width: 768px) and (hover: hover)');
+    const calmMedia = window.matchMedia('(prefers-reduced-motion: reduce)');
     const panels = Array.from(wheel.querySelectorAll<HTMLElement>('.panel'));
-    let cur = window.scrollY;
-    let raf = 0;
 
     const resetStyles = () => {
       for (const p of panels) {
         p.style.transform = '';
+        p.style.transformOrigin = '';
         p.style.opacity = '';
       }
     };
 
+    if (!desktopMedia.matches || calmMedia.matches) {
+      resetStyles();
+      return;
+    }
+
+    let cur = window.scrollY;
+    let raf = 0;
+
     const roll = () => {
       raf = 0;
-      if (window.innerWidth < 768) {
+      if (!desktopMedia.matches || calmMedia.matches) {
         resetStyles();
         return;
       }
@@ -232,6 +238,7 @@ export default function App() {
         const vt = p.offsetTop - cur;
         if (h > window.innerHeight * 1.25 || p.classList.contains('tall')) {
           p.style.transform = '';
+          p.style.transformOrigin = '';
           p.style.opacity = '';
           continue;
         }
@@ -696,7 +703,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-black text-[#e6e6e6]">
       {/* Minimalist Top Bar: Corner Book Icon + Brand | About + Login/Register */}
-      <header className="sticky top-0 z-40 border-b border-[#1c1c1c] bg-black/90 backdrop-blur-md">
+      <header className="sticky top-0 z-40 border-b border-[#1c1c1c] bg-black md:bg-black/90 md:backdrop-blur-md">
         <div className="mx-auto flex h-14 max-w-[62rem] items-center justify-between gap-2 px-4 sm:h-16 sm:px-6">
           <a
             href="#top"

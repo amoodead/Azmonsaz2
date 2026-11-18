@@ -3,10 +3,10 @@ import {
   AlertCircle,
   CheckCircle2,
   Clock,
+  Download,
   HelpCircle,
   Lightbulb,
   Loader2,
-  Printer,
   RefreshCw,
   RotateCcw,
   Target,
@@ -20,6 +20,7 @@ import {
   getSubjectById,
   toPersianDigits,
 } from '../data/curriculum';
+import { downloadExamAsPdf } from '../utils/pdfExport';
 import type {
   ExamAnalysis,
   ExamConfig,
@@ -56,8 +57,8 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
   const [revealedHints, setRevealedHints] = useState<Record<string, boolean>>({});
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [filterTab, setFilterTab] = useState<'mistakes' | 'all'>('mistakes');
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
 
-  // Reset local answering state whenever a new generated exam arrives
   useEffect(() => {
     if (exam && !result) {
       setAnswers({});
@@ -114,39 +115,59 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
         })
     : questions.map((q, idx) => ({ q, number: idx + 1 }));
 
+  const handleDownloadPdf = async () => {
+    setIsExportingPdf(true);
+    try {
+      await downloadExamAsPdf({ exam, config, result });
+    } finally {
+      setIsExportingPdf(false);
+    }
+  };
+
   return (
     <div
       id="sheet"
-      className="exam-sheet mt-8 max-w-[62rem] rounded-[6px] bg-[#ededed] p-5 text-[#111111] sm:p-8"
+      className="exam-sheet mt-2 max-w-[62rem] rounded-[6px] bg-[#ededed] p-4 text-[#111111] sm:p-8"
     >
-      {/* Paper Sheet Header (matches template .sheet header) */}
-      <header className="mb-6 flex flex-wrap items-center justify-between gap-3 border-b-2 border-[#111111] pb-3.5 text-sm font-medium">
-        <div className="font-extrabold text-base sm:text-lg">
-          {examTitle || `آزمون ${subject.name} — پایه‌ی ${getGradeLabel(activeGrade)}`}
+      {/* Paper Sheet Header */}
+      <header className="mb-6 flex flex-col gap-3 border-b-2 border-[#111111] pb-3.5 text-sm font-medium sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <div className="text-base font-extrabold leading-7 sm:text-lg">
+            {examTitle || `آزمون ${subject.name} — ${getGradeLabel(activeGrade)}`}
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-[#444] tabular-nums">
+            <span>{selectedLessonsText}</span>
+            <span>سطح: {getDifficultyLabel(activeDifficulty)}</span>
+            {!result ? (
+              <span className="inline-flex items-center gap-1 font-bold text-[#111]">
+                <Clock className="h-3.5 w-3.5" />
+                {remainingSeconds !== null
+                  ? `باقی‌مانده: ${formatDurationPersian(remainingSeconds)}`
+                  : `زمان: ${formatDurationPersian(elapsedSeconds)}`}
+              </span>
+            ) : (
+              <span className="font-bold text-[#111]">
+                زمان: {formatDurationPersian(result.timeSpentSeconds)}
+              </span>
+            )}
+          </div>
         </div>
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-[#444] tabular-nums">
-          <span>{selectedLessonsText}</span>
-          <span>سطح: {getDifficultyLabel(activeDifficulty)}</span>
-          {!result ? (
-            <span className="inline-flex items-center gap-1 font-bold text-[#111]">
-              <Clock className="h-3.5 w-3.5" />
-              {remainingSeconds !== null
-                ? `باقی‌مانده: ${formatDurationPersian(remainingSeconds)}`
-                : `زمان: ${formatDurationPersian(elapsedSeconds)}`}
-            </span>
-          ) : (
-            <span className="font-bold text-[#111]">
-              زمان: {formatDurationPersian(result.timeSpentSeconds)}
-            </span>
-          )}
-        </div>
+
+        <button
+          type="button"
+          onClick={onResetToNew}
+          className="inline-flex min-h-[38px] w-full shrink-0 items-center justify-center gap-1.5 rounded-[6px] border border-[#111] bg-white px-3 py-1.5 text-xs font-bold text-[#111] transition-colors hover:bg-[#111] hover:text-white sm:w-auto"
+        >
+          <RotateCcw className="h-3.5 w-3.5" />
+          <span>{result ? 'بستن کارنامه و ساخت آزمون جدید' : 'بستن آزمون و بازگشت'}</span>
+        </button>
       </header>
 
-      {/* Results Summary Banner inside Paper Sheet */}
+      {/* Results Summary Banner */}
       {result && (
-        <div className="mb-7 space-y-5 border-b border-[#ccc] pb-6">
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <div className="rounded-[6px] bg-[#111111] p-3.5 text-center text-white">
+        <div className="mb-6 space-y-5 border-b border-[#ccc] pb-6">
+          <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4 sm:gap-3">
+            <div className="rounded-[6px] bg-[#111111] p-3 text-center text-white sm:p-3.5">
               <span className="block text-xs text-[#bdbdbd]">نمره از ۲۰</span>
               <span className="mt-1 block text-2xl font-extrabold tabular-nums">
                 {toPersianDigits(result.scoreOutOf20)}
@@ -156,21 +177,21 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
               </span>
             </div>
 
-            <div className="rounded-[6px] border border-[#ccc] bg-white p-3.5 text-center">
+            <div className="rounded-[6px] border border-[#ccc] bg-white p-3 text-center sm:p-3.5">
               <span className="block text-xs text-[#555]">صحیح</span>
               <span className="mt-1 block text-2xl font-extrabold text-emerald-700 tabular-nums">
                 {toPersianDigits(result.correctCount)}
               </span>
             </div>
 
-            <div className="rounded-[6px] border border-[#ccc] bg-white p-3.5 text-center">
+            <div className="rounded-[6px] border border-[#ccc] bg-white p-3 text-center sm:p-3.5">
               <span className="block text-xs text-[#555]">غلط</span>
               <span className="mt-1 block text-2xl font-extrabold text-rose-700 tabular-nums">
                 {toPersianDigits(result.wrongCount)}
               </span>
             </div>
 
-            <div className="rounded-[6px] border border-[#ccc] bg-white p-3.5 text-center">
+            <div className="rounded-[6px] border border-[#ccc] bg-white p-3 text-center sm:p-3.5">
               <span className="block text-xs text-[#555]">نزده</span>
               <span className="mt-1 block text-2xl font-extrabold text-[#444] tabular-nums">
                 {toPersianDigits(result.unansweredCount)}
@@ -185,9 +206,9 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
             </h3>
 
             {isAnalyzing && (
-              <div className="flex items-center gap-2.5 py-5 text-sm text-[#444]">
+              <div className="flex items-center gap-2.5 py-4 text-sm text-[#444]">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                <span>در حال بررسی پاسخ‌ها و نوشتن توضیح غلط‌ها...</span>
+                <span>در حال تحلیل سریع پاسخ‌ها و نوشتن توضیح غلط‌ها...</span>
               </div>
             )}
 
@@ -226,7 +247,7 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
                     <p className="mt-1 text-xs text-[#444]">
                       {analysis.weakTopics.length > 0
                         ? analysis.weakTopics.join(' · ')
-                        : 'همه مباحث خوب بود!'}
+                        : 'همه مباحث عالی بود!'}
                     </p>
                   </div>
                 </div>
@@ -245,13 +266,12 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
             )}
           </div>
 
-          {/* Filter Tabs on Results */}
           {result.wrongCount + result.unansweredCount > 0 && (
-            <div className="no-print flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={() => setFilterTab('mistakes')}
-                className={`min-h-[36px] rounded-[6px] px-3.5 py-1.5 text-xs font-bold transition-colors ${
+                className={`min-h-[38px] rounded-[6px] px-3.5 py-1.5 text-xs font-bold transition-colors ${
                   filterTab === 'mistakes'
                     ? 'bg-[#111] text-white'
                     : 'border border-[#bbb] bg-white text-[#333] hover:border-[#111]'
@@ -262,26 +282,30 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
               <button
                 type="button"
                 onClick={() => setFilterTab('all')}
-                className={`min-h-[36px] rounded-[6px] px-3.5 py-1.5 text-xs font-bold transition-colors ${
+                className={`min-h-[38px] rounded-[6px] px-3.5 py-1.5 text-xs font-bold transition-colors ${
                   filterTab === 'all'
                     ? 'bg-[#111] text-white'
                     : 'border border-[#bbb] bg-white text-[#333] hover:border-[#111]'
                 }`}
               >
-                همه سوالات ({toPersianDigits(totalCount)})
+                همه سؤالات ({toPersianDigits(totalCount)})
               </button>
             </div>
           )}
         </div>
       )}
 
-      {/* Questions List (Interactive Answering OR Graded Breakdown) */}
+      {/* Questions List */}
       {result && visibleQuestions.length === 0 ? (
         <div className="rounded-[6px] border border-[#ccc] bg-white p-6 text-center text-sm font-bold text-emerald-800">
-          همه سوال‌ها را درست جواب دادی! تب «همه سوالات» را بزن تا مرور کنی.
+          همه سؤال‌ها را درست جواب دادی! تب «همه سؤالات» را بزن تا مرور کنی.
         </div>
       ) : (
-        <ol className="space-y-6">
+        <ol
+          onCopy={!result ? (e) => e.preventDefault() : undefined}
+          onCut={!result ? (e) => e.preventDefault() : undefined}
+          className={`space-y-5 ${!result ? 'exam-live-protected' : ''}`}
+        >
           {visibleQuestions.map(({ q, number }) => {
             const studentAns = result ? result.answers[q.id] : answers[q.id];
             const isCorrect = result ? studentAns === q.correctIndex : false;
@@ -300,7 +324,7 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
               >
                 <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-xs text-[#666]">
                   <div>
-                    <span className="font-bold text-[#111]">سوال {toPersianDigits(number)}</span>
+                    <span className="font-bold text-[#111]">سؤال {toPersianDigits(number)}</span>
                     <span className="mx-1.5" aria-hidden="true">·</span>
                     <span>{q.topicTag}</span>
                   </div>
@@ -311,7 +335,7 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
                       onClick={() =>
                         setRevealedHints((prev) => ({ ...prev, [q.id]: !prev[q.id] }))
                       }
-                      className="no-print inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium text-[#444] hover:bg-[#f0f0f0]"
+                      className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium text-[#444] hover:bg-[#f0f0f0]"
                     >
                       <HelpCircle className="h-3.5 w-3.5" />
                       <span>{revealedHints[q.id] ? 'بستن راهنما' : 'راهنمایی'}</span>
@@ -392,7 +416,6 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
                   })}
                 </div>
 
-                {/* Wrong-answer deep explanation */}
                 {result && !isCorrect && breakdown && (
                   <div className="mt-4 space-y-2 border-t border-[#e5e5e5] pt-3 text-xs leading-6 sm:text-sm sm:leading-7">
                     <div className="rounded bg-rose-50 p-3 text-[#222]">
@@ -427,8 +450,8 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
         </ol>
       )}
 
-      {/* Sheet Bottom Tools (matches template .tools) */}
-      <div className="no-print mt-6 flex flex-wrap items-center justify-between gap-3 border-t border-[#ccc] pt-4">
+      {/* Bottom Tools with direct PDF download */}
+      <div className="mt-6 flex flex-col gap-3 border-t border-[#ccc] pt-4 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
         {!result ? (
           <>
             <span className="text-xs font-medium text-[#555] tabular-nums">
@@ -437,19 +460,32 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={() => window.print()}
-                className="inline-flex min-h-[42px] items-center gap-1.5 rounded-[6px] border border-[#111] bg-white px-4 py-2 text-xs font-bold text-[#111] hover:bg-[#e5e5e5]"
+                onClick={onResetToNew}
+                className="inline-flex min-h-[42px] flex-1 items-center justify-center gap-1.5 rounded-[6px] border border-[#bbb] bg-white px-3.5 py-2 text-xs font-bold text-[#333] hover:border-[#111] hover:text-[#111] sm:flex-none"
               >
-                <Printer className="h-3.5 w-3.5" />
-                <span>چاپ برگه</span>
+                <RotateCcw className="h-3.5 w-3.5" />
+                <span>لغو و ساخت جدید</span>
+              </button>
+              <button
+                type="button"
+                disabled={isExportingPdf}
+                onClick={handleDownloadPdf}
+                className="inline-flex min-h-[42px] flex-1 items-center justify-center gap-1.5 rounded-[6px] border border-[#111] bg-white px-4 py-2 text-xs font-bold text-[#111] hover:bg-[#e5e5e5] disabled:opacity-60 sm:flex-none"
+              >
+                {isExportingPdf ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Download className="h-3.5 w-3.5" />
+                )}
+                <span>{isExportingPdf ? 'در حال ساخت PDF...' : 'دانلود PDF'}</span>
               </button>
               <button
                 type="button"
                 onClick={() => onSubmitExam(answers, elapsedSeconds)}
-                className="inline-flex min-h-[42px] items-center gap-1.5 rounded-[6px] bg-[#111111] px-5 py-2 text-sm font-bold text-white hover:bg-[#2a2a2a]"
+                className="inline-flex min-h-[44px] w-full items-center justify-center gap-1.5 rounded-[6px] bg-[#111111] px-5 py-2 text-sm font-bold text-white hover:bg-[#2a2a2a] sm:w-auto"
               >
                 <CheckCircle2 className="h-4 w-4" />
-                <span>ثبت پاسخ و تحلیل غلط‌ها</span>
+                <span>پایان آزمون و تحلیل غلط‌ها</span>
               </button>
             </div>
           </>
@@ -457,11 +493,16 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
           <>
             <button
               type="button"
-              onClick={() => window.print()}
-              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-[6px] border border-[#111] bg-white px-4 py-2 text-xs font-bold text-[#111] hover:bg-[#e5e5e5]"
+              disabled={isExportingPdf}
+              onClick={handleDownloadPdf}
+              className="inline-flex min-h-[42px] w-full items-center justify-center gap-1.5 rounded-[6px] border border-[#111] bg-white px-4 py-2 text-xs font-bold text-[#111] hover:bg-[#e5e5e5] disabled:opacity-60 sm:w-auto"
             >
-              <Printer className="h-3.5 w-3.5" />
-              <span>چاپ کارنامه</span>
+              {isExportingPdf ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Download className="h-3.5 w-3.5" />
+              )}
+              <span>{isExportingPdf ? 'در حال ساخت PDF...' : 'دانلود PDF کارنامه'}</span>
             </button>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -469,7 +510,7 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
                 <button
                   type="button"
                   onClick={() => onPracticeWeakTopics(analysis.weakTopics)}
-                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-[6px] border border-[#111] bg-white px-4 py-2 text-xs font-bold text-[#111] hover:bg-[#e5e5e5]"
+                  className="inline-flex min-h-[42px] flex-1 items-center justify-center gap-1.5 rounded-[6px] border border-[#111] bg-white px-4 py-2 text-xs font-bold text-[#111] hover:bg-[#e5e5e5] sm:flex-none"
                 >
                   <Target className="h-3.5 w-3.5" />
                   <span>تمرین روی مباحث غلط</span>
@@ -478,10 +519,10 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
               <button
                 type="button"
                 onClick={onResetToNew}
-                className="inline-flex min-h-[40px] items-center gap-1.5 rounded-[6px] bg-[#111111] px-4 py-2 text-xs font-bold text-white hover:bg-[#2a2a2a]"
+                className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-1.5 rounded-[6px] bg-[#111111] px-4 py-2 text-xs font-bold text-white hover:bg-[#2a2a2a] sm:flex-none"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
-                <span>آزمون جدید</span>
+                <span>پایان و ساخت آزمون جدید</span>
               </button>
             </div>
           </>

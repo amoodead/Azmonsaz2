@@ -3,6 +3,14 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import {
+  clearUserExamsInDb,
+  getUserExamsFromDb,
+  loginEmailUser,
+  registerEmailUser,
+  saveUserExamToDb,
+} from './src/db/users.ts';
+import { requireAuth, type AuthRequest } from './src/middleware/auth.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,16 +35,46 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+function isRateLimitOrTransient(error: unknown): boolean {
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return (
+    msg.includes('429') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('quota') ||
+    msg.includes('rate') ||
+    msg.includes('503') ||
+    msg.includes('unavailable') ||
+    msg.includes('overloaded') ||
+    msg.includes('500') ||
+    msg.includes('timeout')
+  );
+}
+
+/**
+ * Fast model execution with automatic multi-model failover:
+ * Primary: gemini-3.1-flash-lite (ThinkingLevel.MINIMAL)
+ * Fallback: gemini-4-hydrogen (ThinkingLevel.LOW)
+ */
+async function generateFastWithFailover<T>(
+  runner: (model: string, thinkingLevel: ThinkingLevel) => Promise<T>
+): Promise<T> {
+  const attempts: Array<{ model: string; thinking: ThinkingLevel; delayBeforeMs: number }> = [
+    { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, delayBeforeMs: 0 },
+    { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, delayBeforeMs: 350 },
+    { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, delayBeforeMs: 900 },
+  ];
+
   let lastError: unknown;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  for (const step of attempts) {
+    if (step.delayBeforeMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, step.delayBeforeMs));
+    }
     try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      if (attempt < maxRetries) {
-        const delayMs = 400 * Math.pow(2, attempt);
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      return await runner(step.model, step.thinking);
+    } catch (err) {
+      lastError = err;
+      if (!isRateLimitOrTransient(err)) {
+        throw err;
       }
     }
   }
@@ -47,16 +85,21 @@ function mapGeminiError(error: unknown): { status: number; message: string } {
   const raw = error instanceof Error ? error.message : String(error);
   const lower = raw.toLowerCase();
 
-  if (lower.includes('api_key_invalid') || lower.includes('permission_denied') || lower.includes('403') || lower.includes('401')) {
+  if (
+    lower.includes('api_key_invalid') ||
+    lower.includes('permission_denied') ||
+    lower.includes('403') ||
+    lower.includes('401')
+  ) {
     return {
       status: 401,
-      message: 'کلید دسترسی هوش مصنوعی معتبر نیست یا مجوز ندارد. لطفاً کلید را در بخش Settings > Secrets بررسی کنید.',
+      message: 'کلید دسترسی هوش مصنوعی معتبر نیست. لطفاً کلید را در بخش Settings > Secrets بررسی کنید.',
     };
   }
-  if (lower.includes('resource_exhausted') || lower.includes('429')) {
+  if (lower.includes('resource_exhausted') || lower.includes('429') || lower.includes('quota')) {
     return {
       status: 429,
-      message: 'سقف درخواست‌های هم‌زمان هوش مصنوعی موقتاً پر شده است. لطفاً چند ثانیه دیگر دوباره تلاش کنید.',
+      message: 'تعداد درخواست‌ها در این دقیقه زیاد بوده است. لطفاً چند ثانیه صبر کرده و دوباره بزنید.',
     };
   }
   if (lower.includes('not_found') || lower.includes('404')) {
@@ -71,6 +114,90 @@ function mapGeminiError(error: unknown): { status: number; message: string } {
   };
 }
 
+// --- Cloud SQL Account & Exam History Routes ---
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, confirmPassword } = req.body as {
+      email?: string;
+      password?: string;
+      confirmPassword?: string;
+    };
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ error: 'لطفاً یک ایمیل معتبر وارد کنید.' });
+    }
+    if (!password || password.length < 6) {
+      return res.status(400).json({ error: 'رمز عبور باید حداقل ۶ کاراکتر باشد.' });
+    }
+    if (password !== confirmPassword) {
+      return res.status(400).json({ error: 'رمز عبور و تکرار آن یکسان نیستند.' });
+    }
+
+    const result = await registerEmailUser(email, password);
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'خطا در ساخت حساب کاربری.' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body as { email?: string; password?: string };
+    if (!email || !password) {
+      return res.status(400).json({ error: 'ایمیل و رمز عبور را وارد کنید.' });
+    }
+    const result = await loginEmailUser(email, password);
+    res.json(result);
+  } catch (err) {
+    res.status(401).json({ error: err instanceof Error ? err.message : 'ورود ناموفق بود.' });
+  }
+});
+
+app.get('/api/auth/me', requireAuth, (req: AuthRequest, res) => {
+  res.json({ user: { id: req.authUser!.uid, email: req.authUser!.email } });
+});
+
+app.get('/api/user/exams', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const exams = await getUserExamsFromDb(req.authUser!.uid);
+    res.json({ exams });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'خطا در دریافت کارنامه‌ها.' });
+  }
+});
+
+app.post('/api/user/exams', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const examEntry = req.body as Record<string, unknown>;
+    if (!examEntry || typeof examEntry.id !== 'string') {
+      return res.status(400).json({ error: 'اطلاعات کارنامه معتبر نیست.' });
+    }
+    await saveUserExamToDb(req.authUser!.uid, req.authUser!.email, examEntry.id, examEntry);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'خطا در ذخیره کارنامه.' });
+  }
+});
+
+app.delete('/api/user/exams', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    await clearUserExamsInDb(req.authUser!.uid);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'خطا در پاک کردن کارنامه‌ها.' });
+  }
+});
+
+// --- Fast, Fresh, Non-Repetitive Exam Generation & Analysis Routes ---
+
+const QUESTION_STYLE_POOLS = [
+  'موقعیت واقعی و زندگی روزمره، سناریوی آزمایشگاهی کوتاه و نتیجه‌گیری مفهومی',
+  'مقایسه مفاهیم هم‌خانواده، پیدا کردن گزینه نادرست (کدام گزینه درست نیست؟) و تله‌های امتحانی هوشمند',
+  'سؤال‌های ترکیبی از چند نکته فصل، تحلیل رابطه علت و معلول و استدلال مرحله‌ای',
+  'مسئله‌های کاربردی، تشخیص اشتباه رایج دانش‌آموزان و مثال‌های خلاقانه شبیه آزمون‌های تیزهوشان و سمپاد',
+];
+
 interface GenerateExamBody {
   gradeLabel: string;
   subjectName: string;
@@ -81,6 +208,8 @@ interface GenerateExamBody {
   questionCount: number;
   difficultyLabel: string;
   difficultyId: 'easy' | 'standard' | 'advanced';
+  recentQuestions?: string[];
+  variationSeed?: number;
 }
 
 app.post('/api/exam/generate', async (req, res) => {
@@ -88,78 +217,81 @@ app.post('/api/exam/generate', async (req, res) => {
     const body = req.body as GenerateExamBody;
     const count = Math.min(25, Math.max(3, Number(body.questionCount) || 5));
 
-    if (!body.gradeLabel || !body.subjectName || (!body.allLessons && (!body.lessonTitles || body.lessonTitles.length === 0))) {
+    if (
+      !body.gradeLabel ||
+      !body.subjectName ||
+      (!body.allLessons && (!body.lessonTitles || body.lessonTitles.length === 0))
+    ) {
       return res.status(400).json({ error: 'لطفاً پایه، درس و حداقل یک فصل را انتخاب کنید.' });
     }
 
     const ai = getGeminiClient();
 
     const scopeText = body.allLessons
-      ? `کل کتاب درسی ${body.subjectName} ${body.gradeLabel}`
-      : `فصل‌ها / درس‌های انتخاب‌شده: ${body.lessonTitles.join('، ')}`;
+      ? `کل کتاب ${body.subjectName} ${body.gradeLabel}`
+      : body.lessonTitles.join('، ');
 
     const topicsContext =
       body.lessonTopics && body.lessonTopics.length > 0
-        ? `مباحث کلیدی کتاب درسی: ${body.lessonTopics.join('؛ ')}`
+        ? `مباحث گسترده: ${body.lessonTopics.join('؛ ')}`
         : '';
 
     const customFocusText = body.customTopic?.trim()
-      ? `تمرکز ویژه دانش‌آموز: «${body.customTopic.trim()}»`
+      ? `تمرکز ویژه: ${body.customTopic.trim()}`
       : '';
 
     const difficultyGuidance =
       body.difficultyId === 'easy'
-        ? 'سطح آسان و مروری: سوالات مستقیم برای تثبیت مفاهیم پایه کتاب.'
+        ? 'آسان و مروری (ولی جذاب و غیرکلیشه‌ای)'
         : body.difficultyId === 'advanced'
-          ? 'سطح پیشرفته و تیزهوشان: سوالات مفهومی و ترکیبی دقیق در چارچوب کتاب.'
-          : 'سطح استاندارد امتحانی: متعادل و مطابق امتحانات مدرسه.';
+          ? 'چالشی، نکته‌دار و سبک تیزهوشان/سمپاد'
+          : 'استاندارد امتحانی با رگه‌هایی از خلاقیت و درک عمیق';
+
+    const seed = Number(body.variationSeed) || Date.now();
+    const angleStyle = QUESTION_STYLE_POOLS[seed % QUESTION_STYLE_POOLS.length];
+    const recentBlock =
+      Array.isArray(body.recentQuestions) && body.recentQuestions.length > 0
+        ? `سؤال‌های تکراری زیر را به هیچ وجه تکرار نکن و موضوع/مثال جدید بساز:\n- ${body.recentQuestions
+            .slice(0, 12)
+            .map((q) => q.slice(0, 90))
+            .join('\n- ')}`
+        : '';
 
     const prompt = `
-دقیقاً ${count} سوال چهارگزینه‌ای استاندارد از کتاب درسی رسمی ایران طراحی کن:
-- پایه: ${body.gradeLabel}
-- درس: ${body.subjectName}
-- محدوده: ${scopeText}
+دقیقاً ${count} سؤال چهارگزینه‌ای تازه، استاندارد و خلاقانه از منابع بزرگ و کتاب درسی رسمی ایران طراحی کن:
+پایه: ${body.gradeLabel} | درس: ${body.subjectName} | محدوده: ${scopeText}
+سطح: ${difficultyGuidance} | سبک غالب این نوبت: ${angleStyle} | کد تنوع: ${seed % 997}
 ${topicsContext}
 ${customFocusText}
-- سطح: ${body.difficultyLabel} (${difficultyGuidance})
+${recentBlock}
 
-قوانین:
-1. کاملاً منطبق بر سرفصل کتاب درسی ${body.gradeLabel} ایران باشد.
-2. هر سوال دقیقاً ۴ گزینه کوتاه و دقیق بدون پیشوند الف/ب/ج/د داشته باشد.
-3. گزینه‌های غلط طبیعی و آموزشی باشند و جایگاه correctIndex (۰ تا ۳) بین سوالات پخش باشد.
-4. hint کوتاه (۱ جمله) و quickExplanation مختصر و روشن بنویس.
+قوانین طراحی:
+- کاملاً منطبق بر سرفصل کتاب درسی ${body.gradeLabel} ایران، اما با مثال‌ها، سناریوها و عددهای تازه و متنوع (تکراری و کلیشه‌ای نباشد).
+- سؤالات حس آزمون حرفه‌ای داشته باشند (ترکیبی از مفهومی، موقعیت کاربردی و تله امتحانی ظریف).
+- ۴ گزینه کوتاه، هم‌وزن و بدون حروف الف/ب/ج/د.
+- جایگاه پاسخ درست (correctIndex از ۰ تا ۳) بین سؤالات پخش باشد.
+- hint و quickExplanation هر کدام حداکثر ۱ جمله کوتاه و دقیق باشد.
 `;
 
-    const response = await withRetry(() =>
+    const response = await generateFastWithFailover((model, thinkingLevel) =>
       ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model,
         contents: prompt,
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          thinkingConfig: { thinkingLevel },
           systemInstruction:
-            'طراح سریع و دقیق سوالات استاندارد دوره اول متوسطه (هفتم، هشتم، نهم) در نظام آموزشی ایران هستی. کوتاه، دقیق، علمی و به فارسی روان بنویس.',
+            'طراح خلاق و حرفه‌ای بانک سؤالات آزمون دوره اول متوسطه ایران (هفتم تا نهم). سؤال‌های تازه، رگ‌دار، علمی، دقیق و به فارسی روان بساز.',
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              examTitle: {
-                type: Type.STRING,
-                description: 'عنوان کوتاه فارسی برای آزمون',
-              },
-              subtitle: {
-                type: Type.STRING,
-                description: 'توضیح کوتاه یک‌خطی',
-              },
-              recommendedMinutes: {
-                type: Type.INTEGER,
-                description: 'زمان پیشنهادی به دقیقه',
-              },
+              examTitle: { type: Type.STRING },
+              recommendedMinutes: { type: Type.INTEGER },
               questions: {
                 type: Type.ARRAY,
                 items: {
                   type: Type.OBJECT,
                   properties: {
-                    id: { type: Type.STRING },
                     question: { type: Type.STRING },
                     options: {
                       type: Type.ARRAY,
@@ -167,24 +299,14 @@ ${customFocusText}
                     },
                     correctIndex: { type: Type.INTEGER },
                     topicTag: { type: Type.STRING },
-                    difficultyLabel: { type: Type.STRING },
                     hint: { type: Type.STRING },
                     quickExplanation: { type: Type.STRING },
                   },
-                  required: [
-                    'id',
-                    'question',
-                    'options',
-                    'correctIndex',
-                    'topicTag',
-                    'difficultyLabel',
-                    'hint',
-                    'quickExplanation',
-                  ],
+                  required: ['question', 'options', 'correctIndex', 'topicTag', 'hint', 'quickExplanation'],
                 },
               },
             },
-            required: ['examTitle', 'subtitle', 'recommendedMinutes', 'questions'],
+            required: ['examTitle', 'recommendedMinutes', 'questions'],
           },
         },
       })
@@ -194,34 +316,39 @@ ${customFocusText}
     const parsed = JSON.parse(rawText);
 
     if (!parsed || !Array.isArray(parsed.questions) || parsed.questions.length === 0) {
-      throw new Error('ساختار سوالات دریافتی از هوش مصنوعی کامل نبود. لطفاً دوباره امتحان کنید.');
+      throw new Error('ساختار سؤالات دریافتی کامل نبود. لطفاً دوباره امتحان کنید.');
     }
 
-    const sanitizedQuestions = parsed.questions.slice(0, count).map((q: Record<string, unknown>, index: number) => {
-      const rawOptions = Array.isArray(q.options) ? q.options.map((o) => String(o)) : [];
-      while (rawOptions.length < 4) {
-        rawOptions.push('هیچ‌کدام');
-      }
-      const options = rawOptions.slice(0, 4) as [string, string, string, string];
-      const rawIndex = Number(q.correctIndex);
-      const correctIndex = Number.isInteger(rawIndex) && rawIndex >= 0 && rawIndex <= 3 ? rawIndex : 0;
+    const sanitizedQuestions = parsed.questions
+      .slice(0, count)
+      .map((q: Record<string, unknown>, index: number) => {
+        const rawOptions = Array.isArray(q.options) ? q.options.map((o) => String(o)) : [];
+        while (rawOptions.length < 4) {
+          rawOptions.push('هیچ‌کدام');
+        }
+        const options = rawOptions.slice(0, 4) as [string, string, string, string];
+        const rawIndex = Number(q.correctIndex);
+        const correctIndex =
+          Number.isInteger(rawIndex) && rawIndex >= 0 && rawIndex <= 3 ? rawIndex : 0;
 
-      return {
-        id: String(q.id || `q-${index + 1}`),
-        question: String(q.question || ''),
-        options,
-        correctIndex,
-        topicTag: String(q.topicTag || body.subjectName),
-        difficultyLabel: String(q.difficultyLabel || body.difficultyLabel),
-        hint: String(q.hint || 'به تعریف اصلی کتاب درسی در این بخش دقت کن.'),
-        quickExplanation: String(q.quickExplanation || ''),
-      };
-    });
+        return {
+          id: `q-${Date.now()}-${index + 1}`,
+          question: String(q.question || ''),
+          options,
+          correctIndex,
+          topicTag: String(q.topicTag || body.subjectName),
+          difficultyLabel: body.difficultyLabel,
+          hint: String(q.hint || 'به مفهوم اصلی درس دقت کن.'),
+          quickExplanation: String(q.quickExplanation || ''),
+        };
+      });
 
     res.json({
       examTitle: String(parsed.examTitle || `آزمون ${body.subjectName} ${body.gradeLabel}`),
-      subtitle: String(parsed.subtitle || scopeText),
-      recommendedMinutes: Number(parsed.recommendedMinutes) || Math.max(5, Math.ceil(sanitizedQuestions.length * 1.2)),
+      subtitle: scopeText,
+      recommendedMinutes:
+        Number(parsed.recommendedMinutes) ||
+        Math.max(5, Math.ceil(sanitizedQuestions.length * 1.2)),
       questions: sanitizedQuestions,
     });
   } catch (error) {
@@ -254,78 +381,81 @@ interface AnalyzeExamBody {
   wrongItems: WrongQuestionPayload[];
 }
 
+const analysisCache = new Map<string, unknown>();
+
 app.post('/api/exam/analyze', async (req, res) => {
   try {
     const body = req.body as AnalyzeExamBody;
+
+    if (!body.wrongItems || body.wrongItems.length === 0) {
+      return res.json({
+        overallSummary: `آفرین! به تمام ${body.totalQuestions} سؤال آزمون ${body.subjectName} (${body.gradeLabel}) پاسخ درست دادی و تسلط کاملی روی این مبحث داشتی.`,
+        strengthTopics: body.correctTopics.length > 0 ? body.correctTopics : [body.lessonScope],
+        weakTopics: [],
+        studyRecommendations: [
+          'مرور خلاصه نکات همین فصل برای ماندگاری طولانی‌مدت در حافظه.',
+          'برای چالش بیشتر، آزمون بعدی را با سطح «چالشی» امتحان کن.',
+        ],
+        wrongBreakdowns: [],
+      });
+    }
+
+    const cacheKey = JSON.stringify({
+      g: body.gradeLabel,
+      s: body.subjectName,
+      w: body.wrongItems.map((i) => `${i.questionId}:${i.studentAnswerIndex}`),
+    });
+    if (analysisCache.has(cacheKey)) {
+      return res.json(analysisCache.get(cacheKey));
+    }
+
     const ai = getGeminiClient();
 
-    const wrongItemsSummary = (body.wrongItems || [])
+    const wrongItemsSummary = body.wrongItems
       .map((item) => {
         const studentChoiceText =
-          item.studentAnswerIndex !== null && item.studentAnswerIndex >= 0 && item.studentAnswerIndex < 4
-            ? `گزینه ${item.studentAnswerIndex + 1}: «${item.options[item.studentAnswerIndex]}»`
-            : 'بدون پاسخ (نزده)';
-        const correctChoiceText = `گزینه ${item.correctAnswerIndex + 1}: «${item.options[item.correctAnswerIndex]}»`;
+          item.studentAnswerIndex !== null &&
+          item.studentAnswerIndex >= 0 &&
+          item.studentAnswerIndex < 4
+            ? `گزینه ${item.studentAnswerIndex + 1}: ${item.options[item.studentAnswerIndex]}`
+            : 'نزده';
+        const correctChoiceText = `گزینه ${item.correctAnswerIndex + 1}: ${item.options[item.correctAnswerIndex]}`;
 
-        return `
-سوال شماره ${item.questionNumber} (شناسه: ${item.questionId} | مبحث: ${item.topicTag}):
-متن سوال: ${item.question}
-انتخاب دانش‌آموز: ${studentChoiceText}
-پاسخ صحیح: ${correctChoiceText}
-`;
+        return `#${item.questionNumber} (${item.questionId} | ${item.topicTag}): ${item.question}\nانتخاب دانش‌آموز: ${studentChoiceText}\nدرست: ${correctChoiceText}`;
       })
       .join('\n---\n');
 
     const prompt = `
-یک دانش‌آموز ${body.gradeLabel} در درس ${body.subjectName} (${body.lessonScope}) آزمونی با ${body.totalQuestions} سوال داده است.
-نتیجه آزمون:
-- تعداد پاسخ صحیح: ${body.correctCount}
-- تعداد پاسخ غلط: ${body.wrongCount}
-- تعداد سوالات نزده: ${body.unansweredCount}
-- درصد نمره: ${body.scorePercent}٪
-- موضوعاتی که دانش‌آموز درست پاسخ داده: ${body.correctTopics.length > 0 ? body.correctTopics.join('، ') : 'ثبت نشده'}
+نتیجه آزمون ${body.subjectName} (${body.gradeLabel} - ${body.lessonScope}):
+درست: ${body.correctCount} | غلط: ${body.wrongCount} | نزده: ${body.unansweredCount} | درصد: ${body.scorePercent}٪
+مباحث درست: ${body.correctTopics.join('، ') || 'ندارد'}
 
-فهرست سوالات غلط یا بدون پاسخ دانش‌آموز:
-${wrongItemsSummary || 'دانش‌آموز به تمام سوالات پاسخ صحیح داده است!'}
+سؤال‌های غلط/نزده:
+${wrongItemsSummary}
 
-وظیفه تو به عنوان معلم و مشاور دلسوز همین پایه تحصیلی:
-1. یک جمع‌بندی دقیق، محترمانه و انگیزه‌بخش درباره عملکرد کلی دانش‌آموز بنویس (overallSummary).
-2. نقاط قوت (strengthTopics) و مباحث نیازمند مرور (weakTopics) را فهرست کن.
-3. ۳ تا ۴ توصیه مطالعاتی عملی و مشخص متناسب با کتاب درسی ${body.subjectName} ${body.gradeLabel} بنویس (studyRecommendations).
-4. برای تک‌تک سوالات غلط یا نزده موجود در فهرست بالا، یک تحلیل اختصاصی در wrongBreakdowns بساز که شامل موارد زیر باشد:
-   - questionId و questionNumber دقیقاً مطابق سوال
-   - wasUnanswered: true اگر نزده بوده و false اگر گزینه غلط انتخاب کرده
-   - misconceptionReason: نام کوتاه خطای ذهنی یا سوءبرداشت (مثلاً «جابه‌جایی عدد اتمی و عدد جرمی» یا «بی‌دقتی در علامت منفی»)
-   - whyWrongSelected: توضیح دقیق اینکه چرا گزینه‌ای که دانش‌آموز انتخاب کرده غلط بوده و معمولاً چرا بچه‌ها به اشتباه آن را می‌زنند (یا اگر نزده، نکته شروع حل سوال چیست)
-   - correctConceptExplanation: آموزش ساده، مرحله‌به‌مرحله و قابل فهم مفهوم اصلی و روش رسیدن به جواب درست برای دانش‌آموز نوجوان
-   - keyTakeaway: یک «نکته طلایی» کوتاه و به‌یادماندنی برای اینکه دیگر این اشتباه را تکرار نکند.
+خلاصه و روشن تحلیل کن:
+- overallSummary: ۲ جمله انگیزشی و دقیق
+- strengthTopics و weakTopics: فهرست کوتاه
+- studyRecommendations: ۲ تا ۳ نکته کوتاه
+- wrongBreakdowns: برای هر سؤال غلط بالا توضیح کوتاه (whyWrongSelected، correctConceptExplanation، keyTakeaway در ۱ تا ۲ جمله).
 `;
 
-    const response = await withRetry(() =>
+    const response = await generateFastWithFailover((model, thinkingLevel) =>
       ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model,
         contents: prompt,
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          thinkingConfig: { thinkingLevel },
           systemInstruction:
-            'معلم دلسوز و دقیق دوره اول متوسطه در ایران هستی. اشتباهات دانش‌آموز را کوتاه، روشن، صمیمی و آموزشی ریشه‌یابی کن.',
+            'معلم سریع و دلسوز دوره اول متوسطه ایران. کوتاه، صمیمی، دقیق و بدون زیاده‌گویی توضیح بده.',
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
             properties: {
               overallSummary: { type: Type.STRING },
-              strengthTopics: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-              weakTopics: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
-              studyRecommendations: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-              },
+              strengthTopics: { type: Type.ARRAY, items: { type: Type.STRING } },
+              weakTopics: { type: Type.ARRAY, items: { type: Type.STRING } },
+              studyRecommendations: { type: Type.ARRAY, items: { type: Type.STRING } },
               wrongBreakdowns: {
                 type: Type.ARRAY,
                 items: {
@@ -351,7 +481,13 @@ ${wrongItemsSummary || 'دانش‌آموز به تمام سوالات پاسخ 
                 },
               },
             },
-            required: ['overallSummary', 'strengthTopics', 'weakTopics', 'studyRecommendations', 'wrongBreakdowns'],
+            required: [
+              'overallSummary',
+              'strengthTopics',
+              'weakTopics',
+              'studyRecommendations',
+              'wrongBreakdowns',
+            ],
           },
         },
       })
@@ -360,13 +496,23 @@ ${wrongItemsSummary || 'دانش‌آموز به تمام سوالات پاسخ 
     const rawText = (response.text ?? '{}').trim();
     const parsed = JSON.parse(rawText);
 
-    res.json({
+    const resultPayload = {
       overallSummary: String(parsed.overallSummary || ''),
       strengthTopics: Array.isArray(parsed.strengthTopics) ? parsed.strengthTopics.map(String) : [],
       weakTopics: Array.isArray(parsed.weakTopics) ? parsed.weakTopics.map(String) : [],
-      studyRecommendations: Array.isArray(parsed.studyRecommendations) ? parsed.studyRecommendations.map(String) : [],
+      studyRecommendations: Array.isArray(parsed.studyRecommendations)
+        ? parsed.studyRecommendations.map(String)
+        : [],
       wrongBreakdowns: Array.isArray(parsed.wrongBreakdowns) ? parsed.wrongBreakdowns : [],
-    });
+    };
+
+    if (analysisCache.size > 100) {
+      const firstKey = analysisCache.keys().next().value;
+      if (firstKey) analysisCache.delete(firstKey);
+    }
+    analysisCache.set(cacheKey, resultPayload);
+
+    res.json(resultPayload);
   } catch (error) {
     const mapped = mapGeminiError(error);
     res.status(mapped.status).json({ error: mapped.message });
@@ -390,7 +536,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Azmoona server listening on http://0.0.0.0:${PORT}`);
+    console.log(`Azmona server listening on http://0.0.0.0:${PORT}`);
   });
 }
 

@@ -12,7 +12,13 @@ import {
   User as UserIcon,
   X,
 } from 'lucide-react';
-import { onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
+import {
+  getRedirectResult,
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut,
+} from 'firebase/auth';
 import { ExamSheet } from './components/ExamSheet';
 import { auth, googleAuthProvider } from './lib/firebase';
 import {
@@ -35,16 +41,59 @@ import type {
 
 const HISTORY_STORAGE_KEY = 'azmoona_exam_history_v1';
 const AUTH_TOKEN_KEY = 'azmoona_auth_token_v1';
+const AUTH_USER_KEY = 'azmoona_auth_user_v1';
+const ACTIVE_SESSION_STORAGE_KEY = 'azmoona_active_session_v1';
 
 interface AuthUser {
   id: string;
   email: string;
 }
 
+function loadSavedAuthUser(): AuthUser | null {
+  try {
+    const raw = window.localStorage.getItem(AUTH_USER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<AuthUser>;
+    if (parsed && typeof parsed.id === 'string' && typeof parsed.email === 'string') {
+      return { id: parsed.id, email: parsed.email };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveAuthSession(token: string | null, user: AuthUser | null): void {
+  try {
+    if (token) {
+      window.localStorage.setItem(AUTH_TOKEN_KEY, token);
+    } else {
+      window.localStorage.removeItem(AUTH_TOKEN_KEY);
+    }
+    if (user) {
+      window.localStorage.setItem(AUTH_USER_KEY, JSON.stringify(user));
+    } else {
+      window.localStorage.removeItem(AUTH_USER_KEY);
+    }
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+interface PersistedSessionState {
+  activeExam: GeneratedExam | null;
+  activeConfig: ExamConfig;
+  examSessionKey: string;
+  currentResult: ExamHistoryEntry | null;
+  draftAnswers: Record<string, number>;
+  draftElapsedSeconds: number;
+  timeSelection: string;
+}
+
 const DEFAULT_CONFIG: ExamConfig = {
-  grade: '8',
+  grade: '7',
   subjectId: 'science',
-  lessonIds: ['sci-8-3'],
+  lessonIds: ['sci-7-1'],
   allLessons: false,
   customTopic: '',
   questionCount: 5,
@@ -63,17 +112,97 @@ function loadGuestHistory(): ExamHistoryEntry[] {
   }
 }
 
+function loadActiveSession(): PersistedSessionState | null {
+  try {
+    const raw = window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PersistedSessionState>;
+    if (!parsed || (!parsed.activeExam && !parsed.currentResult)) return null;
+    return {
+      activeExam: parsed.activeExam ?? null,
+      activeConfig: parsed.activeConfig ?? DEFAULT_CONFIG,
+      examSessionKey: parsed.examSessionKey || `exam-${Date.now()}`,
+      currentResult: parsed.currentResult ?? null,
+      draftAnswers: parsed.draftAnswers ?? {},
+      draftElapsedSeconds: Number(parsed.draftElapsedSeconds) || 0,
+      timeSelection: parsed.timeSelection || 'auto',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeActiveSessionSync(state: PersistedSessionState | null): void {
+  try {
+    if (!state || (!state.activeExam && !state.currentResult)) {
+      window.localStorage.removeItem(ACTIVE_SESSION_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(ACTIVE_SESSION_STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+async function safeParseJson(res: Response): Promise<Record<string, unknown>> {
+  try {
+    const text = await res.text();
+    if (!text) return {};
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function mapFirebaseAuthError(code: string): string {
+  if (code === 'auth/unauthorized-domain') {
+    return 'این دامنه در بخش دامنه‌های مجاز (Authorized domains) تنظیمات Firebase ثبت نشده است.';
+  }
+  if (code === 'auth/operation-not-allowed') {
+    return 'ورود با گوگل در کنسول Firebase فعال نشده است. از ایمیل و رمز عبور استفاده کنید.';
+  }
+  if (code === 'auth/network-request-failed') {
+    return 'اتصال اینترنت یا دسترسی به سرویس گوگل برقرار نشد.';
+  }
+  if (code === 'auth/popup-blocked' || code === 'auth/operation-not-supported-in-this-environment') {
+    return 'مرورگر اجازه باز شدن پنجره گوگل را نداد. لطفاً با ایمیل و رمز عبور وارد شوید.';
+  }
+  return 'ورود با حساب گوگل انجام نشد. لطفاً دوباره امتحان کنید یا با ایمیل اکانت بسازید.';
+}
+
 export default function App() {
-  const [config, setConfig] = useState<ExamConfig>(DEFAULT_CONFIG);
-  const [timeSelection, setTimeSelection] = useState<string>('auto');
+  const initialSessionRef = useRef<PersistedSessionState | null | undefined>(undefined);
+  if (initialSessionRef.current === undefined) {
+    initialSessionRef.current = loadActiveSession();
+  }
+  const restoredSession = initialSessionRef.current;
+
+  const [config, setConfig] = useState<ExamConfig>(
+    restoredSession?.activeConfig ?? DEFAULT_CONFIG
+  );
+  const [timeSelection, setTimeSelection] = useState<string>(
+    restoredSession?.timeSelection ?? 'auto'
+  );
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [generateError, setGenerateError] = useState<string | null>(null);
-  const [activeExam, setActiveExam] = useState<GeneratedExam | null>(null);
-  const [activeConfig, setActiveConfig] = useState<ExamConfig>(DEFAULT_CONFIG);
-  const [examSessionKey, setExamSessionKey] = useState<string>('init');
+  const [activeExam, setActiveExam] = useState<GeneratedExam | null>(
+    restoredSession?.activeExam ?? null
+  );
+  const [activeConfig, setActiveConfig] = useState<ExamConfig>(
+    restoredSession?.activeConfig ?? DEFAULT_CONFIG
+  );
+  const [examSessionKey, setExamSessionKey] = useState<string>(
+    restoredSession?.examSessionKey ?? 'init'
+  );
+  const [draftAnswers, setDraftAnswers] = useState<Record<string, number>>(
+    restoredSession?.draftAnswers ?? {}
+  );
+  const [draftElapsedSeconds, setDraftElapsedSeconds] = useState<number>(
+    restoredSession?.draftElapsedSeconds ?? 0
+  );
 
-  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(() => loadSavedAuthUser());
   const [authToken, setAuthToken] = useState<string | null>(() => {
     try {
       return window.localStorage.getItem(AUTH_TOKEN_KEY);
@@ -81,9 +210,20 @@ export default function App() {
       return null;
     }
   });
+  const [authSource, setAuthSource] = useState<'local' | 'firebase' | null>(() => {
+    try {
+      return window.localStorage.getItem(AUTH_TOKEN_KEY) || window.localStorage.getItem(AUTH_USER_KEY)
+        ? 'local'
+        : null;
+    } catch {
+      return null;
+    }
+  });
 
   const [history, setHistory] = useState<ExamHistoryEntry[]>(() => loadGuestHistory());
-  const [currentResult, setCurrentResult] = useState<ExamHistoryEntry | null>(null);
+  const [currentResult, setCurrentResult] = useState<ExamHistoryEntry | null>(
+    restoredSession?.currentResult ?? null
+  );
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
 
@@ -111,52 +251,182 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [showAboutModal, authModalMode]);
 
-  // Listen to Firebase Auth state (token kept strictly in React state memory, never localStorage)
+  // Scroll directly to restored active exam/result after page refresh so it never looks lost
   useEffect(() => {
+    if (!restoredSession?.activeExam && !restoredSession?.currentResult) return;
+    const timer = window.setTimeout(() => {
+      document.getElementById('sheet')?.scrollIntoView({ behavior: 'auto', block: 'start' });
+    }, 80);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist active exam / report card across browser refresh + mobile pagehide
+  useEffect(() => {
+    const stateToSave: PersistedSessionState | null =
+      !activeExam && !currentResult
+        ? null
+        : {
+            activeExam,
+            activeConfig,
+            examSessionKey,
+            currentResult,
+            draftAnswers,
+            draftElapsedSeconds,
+            timeSelection,
+          };
+
+    writeActiveSessionSync(stateToSave);
+
+    const flushSession = () => writeActiveSessionSync(stateToSave);
+    window.addEventListener('pagehide', flushSession);
+    window.addEventListener('beforeunload', flushSession);
+    return () => {
+      window.removeEventListener('pagehide', flushSession);
+      window.removeEventListener('beforeunload', flushSession);
+    };
+  }, [
+    activeExam,
+    activeConfig,
+    examSessionKey,
+    currentResult,
+    draftAnswers,
+    draftElapsedSeconds,
+    timeSelection,
+  ]);
+
+  // Exchange a Firebase ID token for a 180-day persistent server session + HttpOnly cookie
+  const exchangeGoogleSession = useCallback(
+    async (idToken: string, fallbackUser: AuthUser): Promise<{ token: string; user: AuthUser }> => {
+      try {
+        const res = await fetch('/api/auth/google', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { token?: string; user?: AuthUser };
+          if (data.token && data.user?.email) {
+            saveAuthSession(data.token, data.user);
+            return { token: data.token, user: data.user };
+          }
+        }
+      } catch {
+        // Ignore transient network hiccup; keep Firebase token & cached user
+      }
+      saveAuthSession(null, fallbackUser);
+      return { token: idToken, user: fallbackUser };
+    },
+    []
+  );
+
+  // Listen to Firebase Auth state & handle mobile redirect sign-in results
+  useEffect(() => {
+    let mounted = true;
+    void getRedirectResult(auth).catch((err: unknown) => {
+      if (!mounted) return;
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code)
+          : '';
+      if (code && code !== 'auth/popup-closed-by-user' && code !== 'auth/cancelled-popup-request') {
+        setAuthError(mapFirebaseAuthError(code));
+        setAuthModalMode('login');
+      }
+    });
+
     const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
-      if (!fbUser) return;
+      if (!fbUser || !mounted) return;
       try {
         const idToken = await fbUser.getIdToken();
-        setAuthToken(idToken);
-        setAuthUser({
+        if (!mounted) return;
+        const fallbackUser: AuthUser = {
           id: fbUser.uid,
           email: fbUser.email || 'کاربر گوگل',
-        });
+        };
+        const session = await exchangeGoogleSession(idToken, fallbackUser);
+        if (!mounted) return;
+
+        setAuthSource(session.token === idToken ? 'firebase' : 'local');
+        setAuthToken(session.token);
+        setAuthUser(session.user);
+
         const examsRes = await fetch('/api/user/exams', {
-          headers: { Authorization: `Bearer ${idToken}` },
+          credentials: 'include',
+          headers: { Authorization: `Bearer ${session.token}` },
         });
-        if (examsRes.ok) {
+        if (examsRes.ok && mounted) {
           const examsData = (await examsRes.json()) as { exams: ExamHistoryEntry[] };
           if (Array.isArray(examsData.exams)) {
             setHistory(examsData.exams);
           }
         }
+        if (mounted) {
+          setAuthModalMode(null);
+        }
       } catch {
         // Ignore transient sync error
       }
     });
-    return () => unsubscribe();
-  }, []);
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, [exchangeGoogleSession]);
 
-  // Verify saved email/password auth session and load account report cards from Cloud SQL
+  // Restore saved account session once on mount via Bearer token OR persistent HttpOnly cookie
+  // Never wipes local login on offline/cold-start network errors — only when server explicitly reports invalid session
   useEffect(() => {
-    if (!authToken) return;
     let cancelled = false;
 
     const loadSession = async () => {
       try {
-        const meRes = await fetch('/api/auth/me', {
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-        if (!meRes.ok) {
-          throw new Error('expired');
+        const headers: Record<string, string> = {};
+        if (authToken) {
+          headers.Authorization = `Bearer ${authToken}`;
         }
-        const meData = (await meRes.json()) as { user: AuthUser };
-        if (cancelled) return;
-        setAuthUser(meData.user);
 
+        const sessionRes = await fetch('/api/auth/session', {
+          credentials: 'include',
+          headers,
+        });
+
+        if (!sessionRes.ok) {
+          // Transient 5xx (e.g. Render cold start) — keep saved session intact
+          return;
+        }
+
+        const sessionData = (await sessionRes.json()) as {
+          authenticated?: boolean;
+          user?: AuthUser | null;
+          token?: string;
+        };
+        if (cancelled) return;
+
+        if (!sessionData.authenticated || !sessionData.user) {
+          if (!auth.currentUser) {
+            setAuthToken(null);
+            setAuthUser(null);
+            setAuthSource(null);
+            saveAuthSession(null, null);
+          }
+          return;
+        }
+
+        const nextToken = sessionData.token || authToken;
+        setAuthSource('local');
+        setAuthToken(nextToken);
+        setAuthUser(sessionData.user);
+        saveAuthSession(nextToken, sessionData.user);
+
+        const examHeaders: Record<string, string> = {};
+        if (nextToken) {
+          examHeaders.Authorization = `Bearer ${nextToken}`;
+        }
         const examsRes = await fetch('/api/user/exams', {
-          headers: { Authorization: `Bearer ${authToken}` },
+          credentials: 'include',
+          headers: examHeaders,
         });
         if (examsRes.ok) {
           const examsData = (await examsRes.json()) as { exams: ExamHistoryEntry[] };
@@ -165,15 +435,7 @@ export default function App() {
           }
         }
       } catch {
-        if (!cancelled) {
-          setAuthToken(null);
-          setAuthUser(null);
-          try {
-            window.localStorage.removeItem(AUTH_TOKEN_KEY);
-          } catch {
-            // ignore
-          }
-        }
+        // Offline / network error — keep logged-in state on phone intact
       }
     };
 
@@ -181,7 +443,8 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authToken]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Persist guest history only when not logged into a server account
   useEffect(() => {
@@ -322,21 +585,25 @@ export default function App() {
   const persistExamToAccount = useCallback(
     async (entry: ExamHistoryEntry, tokenOverride?: string | null) => {
       const token = tokenOverride ?? authToken;
-      if (!token) return;
+      if (!token && !authUser) return;
       try {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (token) {
+          headers.Authorization = `Bearer ${token}`;
+        }
         await fetch('/api/user/exams', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
+          credentials: 'include',
+          headers,
           body: JSON.stringify(entry),
         });
       } catch {
         // Ignore network hiccup
       }
     },
-    [authToken]
+    [authToken, authUser]
   );
 
   const handleAuthSubmit = async (e: React.FormEvent) => {
@@ -344,7 +611,8 @@ export default function App() {
     if (!authModalMode) return;
     setAuthError(null);
 
-    if (!authEmail.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(authEmail.trim())) {
+    const trimmedEmail = authEmail.trim();
+    if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
       setAuthError('لطفاً یک ایمیل معتبر وارد کنید.');
       return;
     }
@@ -364,34 +632,41 @@ export default function App() {
       const body =
         authModalMode === 'register'
           ? {
-              email: authEmail.trim(),
+              email: trimmedEmail,
               password: authPassword,
               confirmPassword: authConfirmPassword,
             }
-          : { email: authEmail.trim(), password: authPassword };
+          : { email: trimmedEmail, password: authPassword };
 
       const res = await fetch(endpoint, {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      const data = await res.json();
+      const data = await safeParseJson(res);
       if (!res.ok) {
-        throw new Error(data.error || 'خطا در احراز هویت.');
+        throw new Error(
+          typeof data.error === 'string' && data.error
+            ? data.error
+            : 'خطا در برقراری ارتباط با سرور احراز هویت.'
+        );
       }
 
-      const token = data.token as string;
+      const token = String(data.token || '');
       const user = data.user as AuthUser;
+      if (!token || !user?.email) {
+        throw new Error('پاسخ سرور برای ورود کامل نبود. لطفاً دوباره امتحان کنید.');
+      }
+
+      saveAuthSession(token, user);
+      setAuthSource('local');
       setAuthToken(token);
       setAuthUser(user);
-      try {
-        window.localStorage.setItem(AUTH_TOKEN_KEY, token);
-      } catch {
-        // ignore
-      }
 
       // Fetch saved exams for this account
       const examsRes = await fetch('/api/user/exams', {
+        credentials: 'include',
         headers: { Authorization: `Bearer ${token}` },
       });
       if (examsRes.ok) {
@@ -415,27 +690,55 @@ export default function App() {
   const handleGoogleSignIn = async () => {
     setAuthError(null);
     setAuthLoading(true);
+    const inIframe = (() => {
+      try {
+        return window.self !== window.top;
+      } catch {
+        return true;
+      }
+    })();
+
     try {
       const cred = await signInWithPopup(auth, googleAuthProvider);
       const idToken = await cred.user.getIdToken();
-      setAuthToken(idToken);
-      setAuthUser({
+      const fallbackUser: AuthUser = {
         id: cred.user.uid,
         email: cred.user.email || 'کاربر گوگل',
-      });
-      // Do not store Firebase ID token in localStorage; load saved exams from Cloud SQL
+      };
+      const session = await exchangeGoogleSession(idToken, fallbackUser);
+
+      setAuthSource(session.token === idToken ? 'firebase' : 'local');
+      setAuthToken(session.token);
+      setAuthUser(session.user);
+
       const examsRes = await fetch('/api/user/exams', {
-        headers: { Authorization: `Bearer ${idToken}` },
+        credentials: 'include',
+        headers: { Authorization: `Bearer ${session.token}` },
       });
       if (examsRes.ok) {
         const examsData = (await examsRes.json()) as { exams: ExamHistoryEntry[] };
         setHistory(Array.isArray(examsData.exams) ? examsData.exams : []);
       }
       setAuthModalMode(null);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '';
-      if (!msg.includes('popup-closed-by-user')) {
-        setAuthError('ورود با حساب گوگل انجام نشد. لطفاً دوباره امتحان کنید.');
+    } catch (err: unknown) {
+      const code =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code?: unknown }).code)
+          : '';
+      if (
+        !inIframe &&
+        (code === 'auth/popup-blocked' ||
+          code === 'auth/operation-not-supported-in-this-environment')
+      ) {
+        // Fallback only on top-level windows (mobile browsers that block popups)
+        try {
+          await signInWithRedirect(auth, googleAuthProvider);
+          return;
+        } catch {
+          setAuthError('مرورگر گوشی اجازه باز شدن پنجره گوگل را نداد. لطفاً با ایمیل وارد شوید.');
+        }
+      } else if (code !== 'auth/popup-closed-by-user' && code !== 'auth/cancelled-popup-request') {
+        setAuthError(mapFirebaseAuthError(code));
       }
     } finally {
       setAuthLoading(false);
@@ -450,23 +753,30 @@ export default function App() {
     } catch {
       // ignore
     }
-    setAuthToken(null);
-    setAuthUser(null);
-    setHistory(loadGuestHistory());
     try {
-      window.localStorage.removeItem(AUTH_TOKEN_KEY);
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
     } catch {
       // ignore
     }
+    saveAuthSession(null, null);
+    setAuthToken(null);
+    setAuthUser(null);
+    setAuthSource(null);
+    setHistory(loadGuestHistory());
   };
 
   const handleClearHistory = async () => {
     setHistory([]);
-    if (authToken) {
+    if (authToken || authUser) {
       try {
+        const headers: Record<string, string> = {};
+        if (authToken) {
+          headers.Authorization = `Bearer ${authToken}`;
+        }
         await fetch('/api/user/exams', {
           method: 'DELETE',
-          headers: { Authorization: `Bearer ${authToken}` },
+          credentials: 'include',
+          headers,
         });
       } catch {
         // ignore
@@ -488,22 +798,29 @@ export default function App() {
       // Clear any previous active exam or result immediately so sessions never mix
       setActiveExam(null);
       setCurrentResult(null);
+      setDraftAnswers({});
+      setDraftElapsedSeconds(0);
 
       try {
         const subject = getSubjectById(targetConfig.subjectId);
         const gradeLessons = subject.lessonsByGrade[targetConfig.grade] ?? [];
-        const selectedLessons = gradeLessons.filter((l) =>
-          targetConfig.lessonIds.includes(l.id)
-        );
+        const selectedLessons = targetConfig.allLessons
+          ? gradeLessons
+          : gradeLessons.filter((l) => targetConfig.lessonIds.includes(l.id));
+        const excludedLessons = targetConfig.allLessons
+          ? []
+          : gradeLessons.filter((l) => !targetConfig.lessonIds.includes(l.id));
 
         const recentQuestions = history
           .filter(
             (h) =>
               h.config.grade === targetConfig.grade &&
-              h.config.subjectId === targetConfig.subjectId
+              h.config.subjectId === targetConfig.subjectId &&
+              (targetConfig.allLessons ||
+                h.config.lessonIds.some((id) => targetConfig.lessonIds.includes(id)))
           )
           .flatMap((h) => h.questions.map((q) => q.question))
-          .slice(0, 14);
+          .slice(0, 12);
 
         const payload = {
           gradeLabel: getGradeLabel(targetConfig.grade),
@@ -511,7 +828,10 @@ export default function App() {
           lessonTitles: selectedLessons.map(
             (l) => `درس ${toPersianDigits(l.number)}: ${l.title}`
           ),
-          lessonTopics: selectedLessons.map((l) => l.topics),
+          lessonTopics: selectedLessons.map((l) => `${l.title}: ${l.topics}`),
+          excludedLessonTitles: excludedLessons.map(
+            (l) => `درس ${toPersianDigits(l.number)}: ${l.title}`
+          ),
           allLessons: targetConfig.allLessons,
           customTopic: targetConfig.customTopic,
           questionCount: targetConfig.questionCount,
@@ -532,12 +852,23 @@ export default function App() {
           throw new Error(data.error || 'خطا در تولید سؤالات آزمون.');
         }
 
-        setExamSessionKey(`exam-${Date.now()}`);
-        setActiveExam(data as GeneratedExam);
+        const newKey = `exam-${Date.now()}`;
+        const generated = data as GeneratedExam;
+        writeActiveSessionSync({
+          activeExam: generated,
+          activeConfig: targetConfig,
+          examSessionKey: newKey,
+          currentResult: null,
+          draftAnswers: {},
+          draftElapsedSeconds: 0,
+          timeSelection,
+        });
+        setExamSessionKey(newKey);
+        setActiveExam(generated);
         setActiveConfig(targetConfig);
 
         window.setTimeout(() => {
-          document.getElementById('builder')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          document.getElementById('sheet')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }, 80);
       } catch (err) {
         setGenerateError(
@@ -693,6 +1024,25 @@ export default function App() {
     [currentResult, handleGenerateExam]
   );
 
+  const handleDraftChange = useCallback(
+    (ans: Record<string, number>, elapsed: number) => {
+      setDraftAnswers(ans);
+      setDraftElapsedSeconds(elapsed);
+      if (activeExam || currentResult) {
+        writeActiveSessionSync({
+          activeExam,
+          activeConfig,
+          examSessionKey,
+          currentResult,
+          draftAnswers: ans,
+          draftElapsedSeconds: elapsed,
+          timeSelection,
+        });
+      }
+    },
+    [activeExam, activeConfig, examSessionKey, currentResult, timeSelection]
+  );
+
   const resolvedTimeLimitMinutes =
     timeSelection === 'none'
       ? null
@@ -707,17 +1057,23 @@ export default function App() {
         <div className="mx-auto flex h-14 max-w-[62rem] items-center justify-between gap-2 px-4 sm:h-16 sm:px-6">
           <a
             href="#top"
-            className="flex items-center gap-2 text-white shrink-0"
+            className="flex items-center gap-2.5 text-white shrink-0"
           >
-            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-white p-1">
+            <span className="flex h-11 w-14 items-center justify-center overflow-hidden rounded-lg bg-white p-0 sm:h-9 sm:w-11">
               <img
                 src="/assets/aistudio/Open_Book_Icon_27f3a556.png"
                 alt="لوگوی آزمونا"
                 referrerPolicy="no-referrer"
-                className="h-full w-full object-contain"
+                className="h-full w-full scale-[1.2] object-contain sm:scale-[1.12]"
               />
             </span>
-            <span className="font-display text-xl tracking-tight sm:text-2xl">آزمونا</span>
+            <div className="leading-none">
+              <span className="font-display block text-xl tracking-tight sm:text-2xl">آزمونا</span>
+              <span className="mt-1 inline-flex items-center gap-1 text-[10px] font-medium text-[#9a9a9a]">
+                <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                <span>نسخه آزمایشی · Demo</span>
+              </span>
+            </div>
           </a>
 
           <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
@@ -733,10 +1089,12 @@ export default function App() {
               <div className="flex items-center gap-1.5 sm:gap-2">
                 <a
                   href="#history-list"
-                  className="hidden sm:inline-flex min-h-[36px] items-center gap-1.5 rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] px-3 py-1.5 text-xs font-medium text-white hover:border-[#666]"
+                  className="inline-flex min-h-[36px] items-center gap-1 rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] px-2 py-1.5 text-[11px] font-medium text-white hover:border-[#666] sm:gap-1.5 sm:px-3 sm:text-xs"
                 >
-                  <UserIcon className="h-3.5 w-3.5" />
-                  <span className="max-w-[140px] truncate">{authUser.email}</span>
+                  <UserIcon className="h-3.5 w-3.5 shrink-0" />
+                  <span className="max-w-[80px] truncate sm:max-w-[140px]">
+                    {authUser.email}
+                  </span>
                 </a>
                 <button
                   type="button"
@@ -778,7 +1136,7 @@ export default function App() {
 
       <main ref={wheelRef} className="wheel" id="wheel">
         {/* Panel 1: Hero */}
-        <section className="panel hero-panel" id="top">
+        <section className="panel hero-panel relative" id="top">
           <div className="mx-auto w-full max-w-[62rem]">
             <h1 className="hero-title">
               آزمونا<span>هفتم تا نهم</span>
@@ -793,12 +1151,64 @@ export default function App() {
                 <span>اسکرول کن</span>
               </div>
 
-              <a
-                href="#builder"
+              <button
+                type="button"
+                onClick={() => {
+                  const target = document.getElementById(
+                    activeExam || currentResult ? 'sheet' : 'builder'
+                  );
+                  if (!target) return;
+                  const targetY = Math.max(
+                    0,
+                    target.getBoundingClientRect().top + window.scrollY - 68
+                  );
+                  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                    window.scrollTo({ top: targetY, behavior: 'instant' as ScrollBehavior });
+                    return;
+                  }
+                  const startY = window.scrollY;
+                  const distance = targetY - startY;
+                  const duration = Math.min(1150, Math.max(600, Math.abs(distance) * 0.55));
+                  let startTime: number | null = null;
+                  let rafId = 0;
+                  let cancelled = false;
+
+                  const stop = () => {
+                    cancelled = true;
+                    if (rafId) window.cancelAnimationFrame(rafId);
+                    cleanup();
+                  };
+                  const cleanup = () => {
+                    window.removeEventListener('wheel', stop);
+                    window.removeEventListener('touchstart', stop);
+                    window.removeEventListener('keydown', stop);
+                  };
+
+                  window.addEventListener('wheel', stop, { passive: true, once: true });
+                  window.addEventListener('touchstart', stop, { passive: true, once: true });
+                  window.addEventListener('keydown', stop, { once: true });
+
+                  const step = (now: number) => {
+                    if (cancelled) return;
+                    if (startTime === null) startTime = now;
+                    const t = Math.min(1, (now - startTime) / duration);
+                    const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+                    window.scrollTo({
+                      top: startY + distance * eased,
+                      behavior: 'instant' as ScrollBehavior,
+                    });
+                    if (t < 1) {
+                      rafId = window.requestAnimationFrame(step);
+                    } else {
+                      cleanup();
+                    }
+                  };
+                  rafId = window.requestAnimationFrame(step);
+                }}
                 className="min-h-[44px] inline-flex items-center justify-center rounded-[6px] bg-white px-5 py-2.5 text-xs font-extrabold text-black transition-opacity hover:opacity-90 sm:text-sm"
               >
                 شروع ساخت آزمون ↓
-              </a>
+              </button>
             </div>
           </div>
         </section>
@@ -988,21 +1398,17 @@ export default function App() {
             <div className="mb-5 sm:mb-6">
               <label className="mb-2 block text-sm text-[#9a9a9a]">سطح دشواری</label>
               <div className="flex flex-wrap gap-2">
-                {DIFFICULTIES.map((diff) => {
-                  const label =
-                    diff.id === 'easy' ? 'آسان' : diff.id === 'standard' ? 'متوسط' : 'چالشی';
-                  return (
-                    <button
-                      key={diff.id}
-                      type="button"
-                      aria-pressed={config.difficulty === diff.id}
-                      onClick={() => setConfig((prev) => ({ ...prev, difficulty: diff.id }))}
-                      className="chip text-xs sm:text-sm"
-                    >
-                      {label}
-                    </button>
-                  );
-                })}
+                {DIFFICULTIES.map((diff) => (
+                  <button
+                    key={diff.id}
+                    type="button"
+                    aria-pressed={config.difficulty === diff.id}
+                    onClick={() => setConfig((prev) => ({ ...prev, difficulty: diff.id }))}
+                    className="chip text-xs sm:text-sm"
+                  >
+                    {diff.label}
+                  </button>
+                ))}
               </div>
             </div>
 
@@ -1059,6 +1465,9 @@ export default function App() {
             config={activeConfig}
             result={currentResult}
             timeLimitMinutes={resolvedTimeLimitMinutes}
+            initialAnswers={draftAnswers}
+            initialElapsedSeconds={draftElapsedSeconds}
+            onDraftChange={handleDraftChange}
             isAnalyzing={isAnalyzing}
             analysisError={analysisError}
             onSubmitExam={handleSubmitExam}
@@ -1067,6 +1476,8 @@ export default function App() {
             onResetToNew={() => {
               setActiveExam(null);
               setCurrentResult(null);
+              setDraftAnswers({});
+              setDraftElapsedSeconds(0);
               setExamSessionKey(`exam-${Date.now()}`);
               document.getElementById('builder')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
             }}
@@ -1162,11 +1573,11 @@ export default function App() {
           <div className="w-full max-w-[27rem] max-h-[90dvh] overflow-y-auto rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] p-5 text-right sm:p-6">
             <div className="flex items-center justify-between border-b border-[#2e2e2e] pb-3">
               <div className="flex items-center gap-2.5">
-                <span className="flex h-7 w-7 items-center justify-center rounded bg-white p-1">
+                <span className="flex h-9 w-11 items-center justify-center overflow-hidden rounded-lg bg-white p-0">
                   <img
                     src="/assets/aistudio/Open_Book_Icon_27f3a556.png"
                     alt="لوگوی آزمونا"
-                    className="h-full w-full object-contain"
+                    className="h-full w-full scale-[1.12] object-contain"
                   />
                 </span>
                 <h2 className="font-display text-2xl text-white">درباره آزمونا</h2>
@@ -1210,9 +1621,9 @@ export default function App() {
           onClick={(e) => {
             if (e.target === e.currentTarget) setAuthModalMode(null);
           }}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 sm:p-4 backdrop-blur-xs"
+          className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/80 p-3 pt-10 sm:items-center sm:p-4 backdrop-blur-xs"
         >
-          <div className="w-full max-w-[27rem] max-h-[90dvh] overflow-y-auto rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] p-5 text-right sm:p-6">
+          <div className="my-auto w-full max-w-[27rem] rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] p-5 text-right sm:p-6">
             <div className="flex items-center justify-between border-b border-[#2e2e2e] pb-3">
               <h2 className="font-display text-2xl text-white">
                 {authModalMode === 'register' ? 'ساخت اکانت آزمونا' : 'ورود به حساب'}
@@ -1232,9 +1643,31 @@ export default function App() {
                 type="button"
                 disabled={authLoading}
                 onClick={handleGoogleSignIn}
-                className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-[6px] border border-[#3a3a3a] bg-[#1a1a1a] px-4 py-2 text-xs font-bold text-white transition-colors hover:border-white disabled:opacity-60 sm:text-sm"
+                className="flex min-h-[46px] w-full items-center justify-center gap-2.5 rounded-[6px] border border-[#3a3a3a] bg-[#1a1a1a] px-4 py-2 text-xs font-bold text-white transition-colors hover:border-white disabled:opacity-60 sm:text-sm"
               >
-                <span>ورود یا ساخت اکانت با گوگل (Google)</span>
+                <svg
+                  className="h-5 w-5 shrink-0"
+                  viewBox="0 0 24 24"
+                  aria-hidden="true"
+                >
+                  <path
+                    fill="#EA4335"
+                    d="M12 10.2v3.9h5.5c-.24 1.25-.96 2.3-2.04 3l3.3 2.56c1.92-1.77 3.04-4.38 3.04-7.48 0-.72-.06-1.41-.18-2.08H12z"
+                  />
+                  <path
+                    fill="#34A853"
+                    d="M12 22c2.7 0 4.96-.9 6.62-2.44l-3.3-2.56c-.9.6-2.05.96-3.32.96-2.55 0-4.71-1.72-5.48-4.04H3.12v2.64C4.77 19.83 8.13 22 12 22z"
+                  />
+                  <path
+                    fill="#FBBC05"
+                    d="M6.52 13.92A5.98 5.98 0 0 1 6.2 12c0-.67.12-1.32.32-1.92V7.44H3.12A9.97 9.97 0 0 0 2 12c0 1.61.39 3.13 1.12 4.56l3.4-2.64z"
+                  />
+                  <path
+                    fill="#4285F4"
+                    d="M12 6.04c1.47 0 2.79.5 3.83 1.5l2.87-2.87C16.95 3.04 14.7 2 12 2 8.13 2 4.77 4.17 3.12 7.44l3.4 2.64C7.29 7.76 9.45 6.04 12 6.04z"
+                  />
+                </svg>
+                <span>اتصال و ورود با حساب گوگل</span>
               </button>
 
               <div className="my-4 flex items-center gap-3 text-[11px] text-[#666]">
@@ -1275,7 +1708,7 @@ export default function App() {
               </button>
             </div>
 
-            <form onSubmit={handleAuthSubmit} className="mt-5 space-y-4 text-right">
+            <form noValidate onSubmit={handleAuthSubmit} className="mt-5 space-y-4 text-right">
               <div>
                 <label htmlFor="auth-email" className="mb-1.5 block text-xs text-[#9a9a9a]">
                   ایمیل
@@ -1283,7 +1716,11 @@ export default function App() {
                 <input
                   id="auth-email"
                   type="email"
-                  required
+                  inputMode="email"
+                  autoComplete="email"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
                   dir={authEmail ? 'ltr' : 'rtl'}
                   value={authEmail}
                   onChange={(e) => setAuthEmail(e.target.value)}
@@ -1299,9 +1736,8 @@ export default function App() {
                 <input
                   id="auth-pass"
                   type="password"
-                  required
-                  minLength={6}
-                  dir="rtl"
+                  autoComplete={authModalMode === 'register' ? 'new-password' : 'current-password'}
+                  dir={authPassword ? 'ltr' : 'rtl'}
                   value={authPassword}
                   onChange={(e) => setAuthPassword(e.target.value)}
                   placeholder="رمز عبور را وارد کنید"
@@ -1317,9 +1753,8 @@ export default function App() {
                   <input
                     id="auth-confirm"
                     type="password"
-                    required
-                    minLength={6}
-                    dir="rtl"
+                    autoComplete="new-password"
+                    dir={authConfirmPassword ? 'ltr' : 'rtl'}
                     value={authConfirmPassword}
                     onChange={(e) => setAuthConfirmPassword(e.target.value)}
                     placeholder="رمز عبور را دوباره وارد کنید"

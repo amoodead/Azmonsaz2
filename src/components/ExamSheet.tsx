@@ -21,6 +21,7 @@ import {
   toPersianDigits,
 } from '../data/curriculum';
 import { downloadExamAsPdf } from '../utils/pdfExport';
+import { parseStructuredQuestion, segmentExamText } from '../utils/mathText';
 import type {
   ExamAnalysis,
   ExamConfig,
@@ -28,11 +29,80 @@ import type {
   GeneratedExam,
 } from '../types/exam';
 
+function FormattedText({ text }: { text: string }) {
+  const segments = segmentExamText(text);
+  return (
+    <>
+      {segments.map((seg, i) => {
+        if (seg.kind === 'math') {
+          return (
+            <span key={i} dir="ltr" className="math-token">
+              {seg.text}
+            </span>
+          );
+        }
+        if (seg.kind === 'latin') {
+          return (
+            <span key={i} dir="ltr" className="latin-token">
+              {seg.text}
+            </span>
+          );
+        }
+        return <React.Fragment key={i}>{seg.text}</React.Fragment>;
+      })}
+    </>
+  );
+}
+
+function FormattedQuestion({ text }: { text: string }) {
+  const parsed = parseStructuredQuestion(text);
+  if (parsed.items.length === 0) {
+    return (
+      <p className="mb-4 whitespace-pre-line text-[15px] font-bold leading-8 text-[#111] sm:text-[17px]">
+        <FormattedText text={text} />
+      </p>
+    );
+  }
+
+  return (
+    <div className="mb-4 space-y-2.5">
+      {parsed.intro && (
+        <p className="whitespace-pre-line text-[15px] font-bold leading-8 text-[#111] sm:text-[17px]">
+          <FormattedText text={parsed.intro} />
+        </p>
+      )}
+      <ul className="space-y-2 rounded-[6px] border border-[#e3e3e3] bg-[#f8f8f8] p-3 sm:p-3.5">
+        {parsed.items.map((item, idx) => (
+          <li
+            key={idx}
+            className="flex items-start gap-2.5 text-[14px] font-medium leading-7 text-[#1a1a1a] sm:text-[15.5px]"
+          >
+            <span className="mt-0.5 inline-flex min-w-[1.85rem] shrink-0 items-center justify-center rounded bg-[#e8e8e8] px-1.5 py-0.5 text-xs font-extrabold text-[#111]">
+              {item.label}
+            </span>
+            <span className="flex-1 whitespace-pre-line">
+              <FormattedText text={item.text} />
+            </span>
+          </li>
+        ))}
+      </ul>
+      {parsed.outro && (
+        <p className="whitespace-pre-line text-[15px] font-bold leading-8 text-[#111] sm:text-[17px]">
+          <FormattedText text={parsed.outro} />
+        </p>
+      )}
+    </div>
+  );
+}
+
 interface ExamSheetProps {
   exam: GeneratedExam | null;
   config: ExamConfig;
   result: ExamHistoryEntry | null;
   timeLimitMinutes: number | null;
+  initialAnswers?: Record<string, number>;
+  initialElapsedSeconds?: number;
+  onDraftChange?: (answers: Record<string, number>, elapsedSeconds: number) => void;
   isAnalyzing: boolean;
   analysisError: string | null;
   onSubmitExam: (answers: Record<string, number>, timeSpentSeconds: number) => void;
@@ -46,6 +116,9 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
   config,
   result,
   timeLimitMinutes,
+  initialAnswers = {},
+  initialElapsedSeconds = 0,
+  onDraftChange,
   isAnalyzing,
   analysisError,
   onSubmitExam,
@@ -53,19 +126,19 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
   onPracticeWeakTopics,
   onResetToNew,
 }) => {
-  const [answers, setAnswers] = useState<Record<string, number>>({});
+  const [answers, setAnswers] = useState<Record<string, number>>(initialAnswers);
   const [revealedHints, setRevealedHints] = useState<Record<string, boolean>>({});
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [elapsedSeconds, setElapsedSeconds] = useState(initialElapsedSeconds);
   const [filterTab, setFilterTab] = useState<'mistakes' | 'all'>('mistakes');
   const [isExportingPdf, setIsExportingPdf] = useState(false);
 
+  const onDraftChangeRef = React.useRef(onDraftChange);
+  onDraftChangeRef.current = onDraftChange;
+
   useEffect(() => {
-    if (exam && !result) {
-      setAnswers({});
-      setRevealedHints({});
-      setElapsedSeconds(0);
-    }
-  }, [exam, result]);
+    if (!exam || result) return;
+    onDraftChangeRef.current?.(answers, elapsedSeconds);
+  }, [exam, result, answers, elapsedSeconds]);
 
   useEffect(() => {
     if (!exam || result) return;
@@ -356,17 +429,15 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
                 </div>
 
                 {!result && revealedHints[q.id] && (
-                  <div className="mb-3 rounded bg-[#f5f5f5] p-2.5 text-xs text-[#333]">
+                  <div className="mb-3.5 rounded bg-[#f5f5f5] p-3 text-xs leading-6 text-[#333] sm:text-sm">
                     <strong>راهنما: </strong>
-                    {q.hint}
+                    <FormattedText text={q.hint} />
                   </div>
                 )}
 
-                <p className="mb-4 text-sm font-bold leading-7 text-[#111] sm:text-base">
-                  {q.question}
-                </p>
+                <FormattedQuestion text={q.question} />
 
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
                   {q.options.map((opt, idx) => {
                     if (!result) {
                       const selected = answers[q.id] === idx;
@@ -377,14 +448,16 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
                           onClick={() =>
                             setAnswers((prev) => ({ ...prev, [q.id]: idx }))
                           }
-                          className={`flex min-h-[46px] items-center gap-2.5 rounded-[6px] border px-3 py-2 text-right text-sm transition-colors ${
+                          className={`flex min-h-[48px] items-start gap-2.5 rounded-[6px] border px-3.5 py-2.5 text-right text-[14px] leading-7 transition-colors sm:text-[15px] ${
                             selected
-                              ? 'border-[#111] bg-[#111] font-semibold text-white'
+                              ? 'option-selected border-[#111] bg-[#111] font-semibold text-white'
                               : 'border-[#d4d4d4] bg-[#fafafa] text-[#222] hover:border-[#111]'
                           }`}
                         >
-                          <span className="font-bold opacity-80">{OPTION_LETTERS[idx]})</span>
-                          <span className="flex-1">{opt}</span>
+                          <span className="shrink-0 font-bold opacity-80">{OPTION_LETTERS[idx]})</span>
+                          <span className="flex-1 whitespace-pre-line">
+                            <FormattedText text={opt} />
+                          </span>
                         </button>
                       );
                     }
@@ -404,11 +477,13 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
                     return (
                       <div
                         key={idx}
-                        className={`flex items-start justify-between gap-2 rounded-[6px] border px-3 py-2.5 text-sm ${cls}`}
+                        className={`flex items-start justify-between gap-2 rounded-[6px] border px-3.5 py-2.5 text-[14px] leading-7 sm:text-[15px] ${cls}`}
                       >
                         <div className="flex items-start gap-2">
-                          <span className="font-bold">{OPTION_LETTERS[idx]})</span>
-                          <span>{opt}</span>
+                          <span className="shrink-0 font-bold">{OPTION_LETTERS[idx]})</span>
+                          <span>
+                            <FormattedText text={opt} />
+                          </span>
                         </div>
                         {tag && <span className="shrink-0 text-xs">{tag}</span>}
                       </div>
@@ -417,31 +492,37 @@ export const ExamSheet: React.FC<ExamSheetProps> = ({
                 </div>
 
                 {result && !isCorrect && breakdown && (
-                  <div className="mt-4 space-y-2 border-t border-[#e5e5e5] pt-3 text-xs leading-6 sm:text-sm sm:leading-7">
+                  <div className="mt-4 space-y-2 border-t border-[#e5e5e5] pt-3 text-xs leading-7 sm:text-sm">
                     <div className="rounded bg-rose-50 p-3 text-[#222]">
                       <strong className="text-rose-800">
                         {breakdown.wasUnanswered ? 'نقطه شروع: ' : 'چرا این گزینه غلط بود؟ '}
                       </strong>
-                      <span>{breakdown.whyWrongSelected}</span>
+                      <span>
+                        <FormattedText text={breakdown.whyWrongSelected} />
+                      </span>
                     </div>
                     <div className="rounded bg-[#f5f5f5] p-3 text-[#222]">
                       <strong className="text-[#111]">توضیح مفهوم و روش حل: </strong>
-                      <span>{breakdown.correctConceptExplanation}</span>
+                      <span>
+                        <FormattedText text={breakdown.correctConceptExplanation} />
+                      </span>
                     </div>
                     <div className="flex items-start gap-2 rounded border border-[#ccc] bg-white p-3 text-[#111]">
                       <Lightbulb className="mt-0.5 h-4 w-4 shrink-0" />
                       <div>
                         <strong>نکته طلایی: </strong>
-                        <span>{breakdown.keyTakeaway}</span>
+                        <span>
+                          <FormattedText text={breakdown.keyTakeaway} />
+                        </span>
                       </div>
                     </div>
                   </div>
                 )}
 
                 {result && (isCorrect || !breakdown) && q.quickExplanation && (
-                  <div className="mt-3 rounded bg-[#f5f5f5] p-3 text-xs leading-6 text-[#333] sm:text-sm">
+                  <div className="mt-3 rounded bg-[#f5f5f5] p-3 text-xs leading-7 text-[#333] sm:text-sm">
                     <strong className="text-[#111]">توضیح: </strong>
-                    {q.quickExplanation}
+                    <FormattedText text={q.quickExplanation} />
                   </div>
                 )}
               </li>

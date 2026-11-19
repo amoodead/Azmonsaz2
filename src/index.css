@@ -19,6 +19,12 @@
     -ms-overflow-style: none;
   }
 
+  @media (prefers-reduced-motion: no-preference) {
+    html {
+      scroll-behavior: smooth;
+    }
+  }
+
   html::-webkit-scrollbar,
   body::-webkit-scrollbar {
     display: none;
@@ -163,6 +169,38 @@
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
+}
+
+.math-token {
+  display: inline-block;
+  direction: ltr;
+  unicode-bidi: isolate;
+  font-family: "Roboto Mono", "Vazirmatn", ui-monospace, monospace;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  line-height: 1.35;
+  padding: 0.08rem 0.42rem;
+  margin: 0 0.16rem;
+  border-radius: 5px;
+  background: #f0f1f4;
+  border: 1px solid #d4d7de;
+  color: #0b0f19;
+  vertical-align: baseline;
+}
+
+.option-selected .math-token {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.34);
+  color: #ffffff;
+}
+
+.latin-token {
+  display: inline-block;
+  direction: ltr;
+  unicode-bidi: isolate;
+  font-weight: 600;
+  margin: 0 0.15rem;
 }
 
 @media (prefers-reduced-motion: reduce) {

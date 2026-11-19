@@ -3,14 +3,18 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { ensureDatabaseSchema } from './src/db/index.ts';
 import {
   clearUserExamsInDb,
+  exchangeFirebaseUserForSession,
   getUserExamsFromDb,
   loginEmailUser,
   registerEmailUser,
   saveUserExamToDb,
+  signLocalAuthToken,
 } from './src/db/users.ts';
-import { requireAuth, type AuthRequest } from './src/middleware/auth.ts';
+import { adminAuth } from './src/lib/firebase-admin.ts';
+import { requireAuth, resolveAuthPrincipal, type AuthRequest } from './src/middleware/auth.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -56,12 +60,13 @@ function isRateLimitOrTransient(error: unknown): boolean {
  * Fallback: gemini-4-hydrogen (ThinkingLevel.LOW)
  */
 async function generateFastWithFailover<T>(
-  runner: (model: string, thinkingLevel: ThinkingLevel) => Promise<T>
+  runner: (model: string, thinkingLevel: ThinkingLevel) => Promise<T>,
+  primaryThinking: ThinkingLevel = ThinkingLevel.MINIMAL
 ): Promise<T> {
   const attempts: Array<{ model: string; thinking: ThinkingLevel; delayBeforeMs: number }> = [
-    { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, delayBeforeMs: 0 },
+    { model: 'gemini-3.1-flash-lite', thinking: primaryThinking, delayBeforeMs: 0 },
     { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, delayBeforeMs: 350 },
-    { model: 'gemini-3.1-flash-lite', thinking: ThinkingLevel.MINIMAL, delayBeforeMs: 900 },
+    { model: 'gemini-3.1-flash-lite', thinking: primaryThinking, delayBeforeMs: 900 },
   ];
 
   let lastError: unknown;
@@ -116,6 +121,37 @@ function mapGeminiError(error: unknown): { status: number; message: string } {
 
 // --- Cloud SQL Account & Exam History Routes ---
 
+const SESSION_MAX_AGE_SEC = 60 * 60 * 24 * 180; // 180 days
+
+function isHttpsRequest(req: express.Request): boolean {
+  const proto = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
+  return req.secure || proto.includes('https');
+}
+
+function setSessionCookie(req: express.Request, res: express.Response, token: string): void {
+  const isHttps = isHttpsRequest(req);
+  const parts = [
+    `azmoona_session=${encodeURIComponent(token)}`,
+    'Path=/',
+    `Max-Age=${SESSION_MAX_AGE_SEC}`,
+    'HttpOnly',
+    isHttps ? 'SameSite=None; Secure' : 'SameSite=Lax',
+  ];
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearSessionCookie(req: express.Request, res: express.Response): void {
+  const isHttps = isHttpsRequest(req);
+  const parts = [
+    'azmoona_session=',
+    'Path=/',
+    'Max-Age=0',
+    'HttpOnly',
+    isHttps ? 'SameSite=None; Secure' : 'SameSite=Lax',
+  ];
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { email, password, confirmPassword } = req.body as {
@@ -135,6 +171,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     const result = await registerEmailUser(email, password);
+    setSessionCookie(req, res, result.token);
     res.status(201).json(result);
   } catch (err) {
     res.status(400).json({ error: err instanceof Error ? err.message : 'خطا در ساخت حساب کاربری.' });
@@ -148,9 +185,57 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'ایمیل و رمز عبور را وارد کنید.' });
     }
     const result = await loginEmailUser(email, password);
+    setSessionCookie(req, res, result.token);
     res.json(result);
   } catch (err) {
     res.status(401).json({ error: err instanceof Error ? err.message : 'ورود ناموفق بود.' });
+  }
+});
+
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const bodyToken = (req.body as { idToken?: string } | undefined)?.idToken;
+    const authHeader = req.headers.authorization;
+    const headerToken =
+      authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const idToken = (bodyToken || headerToken || '').trim();
+
+    if (!idToken) {
+      return res.status(400).json({ error: 'توکن گوگل ارسال نشده است.' });
+    }
+
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    const email = decoded.email || `${decoded.uid}@azmona.local`;
+    const result = await exchangeFirebaseUserForSession(decoded.uid, email);
+    setSessionCookie(req, res, result.token);
+    res.json(result);
+  } catch (err) {
+    console.error('Google session exchange error:', err);
+    res.status(401).json({ error: 'اعتبارسنجی ورود گوگل ناموفق بود.' });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  clearSessionCookie(req, res);
+  res.json({ ok: true });
+});
+
+app.get('/api/auth/session', async (req, res) => {
+  try {
+    const principal = await resolveAuthPrincipal(req);
+    if (!principal) {
+      return res.json({ authenticated: false, user: null });
+    }
+    const freshToken = signLocalAuthToken(principal.uid, principal.email);
+    setSessionCookie(req, res, freshToken);
+    res.json({
+      authenticated: true,
+      user: { id: principal.uid, email: principal.email },
+      token: freshToken,
+    });
+  } catch (err) {
+    console.error('Session restore error:', err);
+    res.status(500).json({ error: 'خطا در بررسی نشست کاربری.' });
   }
 });
 
@@ -160,7 +245,7 @@ app.get('/api/auth/me', requireAuth, (req: AuthRequest, res) => {
 
 app.get('/api/user/exams', requireAuth, async (req: AuthRequest, res) => {
   try {
-    const exams = await getUserExamsFromDb(req.authUser!.uid);
+    const exams = await getUserExamsFromDb(req.authUser!.uid, req.authUser!.email);
     res.json({ exams });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : 'خطا در دریافت کارنامه‌ها.' });
@@ -182,7 +267,7 @@ app.post('/api/user/exams', requireAuth, async (req: AuthRequest, res) => {
 
 app.delete('/api/user/exams', requireAuth, async (req: AuthRequest, res) => {
   try {
-    await clearUserExamsInDb(req.authUser!.uid);
+    await clearUserExamsInDb(req.authUser!.uid, req.authUser!.email);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : 'خطا در پاک کردن کارنامه‌ها.' });
@@ -191,18 +276,30 @@ app.delete('/api/user/exams', requireAuth, async (req: AuthRequest, res) => {
 
 // --- Fast, Fresh, Non-Repetitive Exam Generation & Analysis Routes ---
 
-const QUESTION_STYLE_POOLS = [
-  'موقعیت واقعی و زندگی روزمره، سناریوی آزمایشگاهی کوتاه و نتیجه‌گیری مفهومی',
-  'مقایسه مفاهیم هم‌خانواده، پیدا کردن گزینه نادرست (کدام گزینه درست نیست؟) و تله‌های امتحانی هوشمند',
-  'سؤال‌های ترکیبی از چند نکته فصل، تحلیل رابطه علت و معلول و استدلال مرحله‌ای',
-  'مسئله‌های کاربردی، تشخیص اشتباه رایج دانش‌آموزان و مثال‌های خلاقانه شبیه آزمون‌های تیزهوشان و سمپاد',
-];
+const STYLE_POOLS_BY_DIFFICULTY: Record<'easy' | 'standard' | 'advanced', string[]> = {
+  easy: [
+    'تعریف‌های اولیه، مفاهیم پایه و تشخیص مستقیم مثال‌های بسیار ساده کتاب درسی',
+    'سؤالات کوتاه تک‌مرحله‌ای، یادآوری سریع نکات اصلی فصل بدون هیچ پیچیدگی',
+    'پرسش‌های شفاف و روان برای مرور مقدماتی پیش از شروع تست‌های کتاب',
+  ],
+  standard: [
+    'سؤالات استاندارد امتحانات نوبت اول و دوم مدارس بر اساس متن و تمرین‌های کتاب درسی',
+    'مثال‌های کاربردی، فعالیت‌ها و پرسش‌های «فکر کنید» و تمرین‌های آخر فصل کتاب درسی',
+    'مقایسه مفاهیم اصلی کتاب درسی و محاسبه‌های مستقیم هم‌سطح نمونه سؤال‌های معلم',
+  ],
+  advanced: [
+    'تست‌های تحلیلی و چندمرحله‌ای در تراز آزمون ورودی تیزهوشان (سمپاد) و کتاب‌های خیلی سبز تیزهوشان / مبتکران از مفاهیم همین فصل',
+    'سؤالات ترکیبی عمیق، استدلال منطقی، گزاره‌های «چند مورد درست است؟» و دام‌های هوشمندانه آزمون‌های تیزهوشان منحصراً در محدوده همین درس',
+    'مسئله‌های چالشی و مفهومی کتاب‌های گاج IQ و رشادت نیازمند دقت بالا و تحلیل عمیق نکاتِ همین فصل انتخاب‌شده',
+  ],
+};
 
 interface GenerateExamBody {
   gradeLabel: string;
   subjectName: string;
   lessonTitles: string[];
   lessonTopics: string[];
+  excludedLessonTitles?: string[];
   allLessons: boolean;
   customTopic?: string;
   questionCount: number;
@@ -233,83 +330,111 @@ app.post('/api/exam/generate', async (req, res) => {
 
     const topicsContext =
       body.lessonTopics && body.lessonTopics.length > 0
-        ? `مباحث گسترده: ${body.lessonTopics.join('؛ ')}`
+        ? `مباحث دقیق و مجاز برای طراحی سؤال:\n- ${body.lessonTopics.join('\n- ')}`
+        : '';
+
+    const excludedBlock =
+      !body.allLessons && Array.isArray(body.excludedLessonTitles) && body.excludedLessonTitles.length > 0
+        ? `فصل‌ها/درس‌های غیرمجاز (به هیچ وجه از این‌ها سؤال نپرس): ${body.excludedLessonTitles.join('، ')}`
         : '';
 
     const customFocusText = body.customTopic?.trim()
-      ? `تمرکز ویژه: ${body.customTopic.trim()}`
+      ? `تمرکز ویژه دانش‌آموز (در صورت هم‌خوانی با درس): ${body.customTopic.trim()}`
       : '';
 
+    const diffId: 'easy' | 'standard' | 'advanced' =
+      body.difficultyId === 'easy' || body.difficultyId === 'advanced'
+        ? body.difficultyId
+        : 'standard';
+
     const difficultyGuidance =
-      body.difficultyId === 'easy'
-        ? 'آسان و مروری (ولی جذاب و غیرکلیشه‌ای)'
-        : body.difficultyId === 'advanced'
-          ? 'چالشی، نکته‌دار و سبک تیزهوشان/سمپاد'
-          : 'استاندارد امتحانی با رگه‌هایی از خلاقیت و درک عمیق';
+      diffId === 'easy'
+        ? 'سطح آسان (یک پله ساده‌تر و پایین‌تر از تمرین‌های عادی کتاب درسی): سؤالات باید خیلی روان، کوتاه، مستقیم و تک‌مرحله‌ای باشند؛ فقط در حد مفاهیم پایه، تعریف‌های اولیه و عددهای بسیار رُند و ساده. به هیچ وجه سؤال چندموردی، پیچیده، ترکیبی یا دارای دام امتحانی طرح نکن و گزینه‌های غلط کاملاً مشخص باشند.'
+        : diffId === 'advanced'
+          ? 'سطح سخت (منحصراً هم‌تراز آزمون‌های ورودی تیزهوشان سمپاد و کتاب‌های کار تیزهوشان مثل خیلی سبز تیزهوشان، مبتکران و IQ): هر سؤال باید چالشی، مفهومی، چندمرحله‌ای و دارای نکته ظریف یا تله تستی هوشمندانه از همین درس باشد (از جمله سؤال‌های «چند مورد زیر درست است؟»، تحلیل سناریو و استدلال عمیق). به هیچ وجه سؤال حفظی ساده یا روتین کتاب نگذار.'
+          : 'سطح متوسط (دقیقاً هم‌سطح کتاب درسی رسمی ایران و امتحانات نوبت اول و دوم مدارس): سؤالات دقیقاً مطابق متن، فعالیت‌ها، آزمایش‌ها و تمرین‌های آخر فصل کتاب درسی باشند؛ نه بیش از حد ابتدایی و نه فراتر از کتاب در سطح تیزهوشان.';
+
+    const difficultySystemRule =
+      diffId === 'easy'
+        ? `معلم صمیمی ${body.subjectName} ${body.gradeLabel} که آزمون بسیار ساده، پایه‌ای و ساده‌تر از کتاب فقط از محدوده «${scopeText}» طراحی می‌کند. خروج از درس یا فصل انتخاب‌شده اکیداً ممنوع است.`
+        : diffId === 'advanced'
+          ? `طراح ارشد سؤالات تیزهوشان (سمپاد) برای درس «${body.subjectName}» ${body.gradeLabel}. فقط تست‌های عمیق و چالشی در تراز تیزهوشان منحصراً از محدوده «${scopeText}» بساز و هرگز به فصل‌ها یا درس‌های دیگر نرو.`
+          : `دبیر رسمی ${body.subjectName} ${body.gradeLabel} در آموزش و پرورش ایران. آزمون استاندارد دقیقاً منطبق بر متن و تمرین‌های «${scopeText}» بساز و از خروج از این درس و فصل اکیداً خودداری کن.`;
 
     const seed = Number(body.variationSeed) || Date.now();
-    const angleStyle = QUESTION_STYLE_POOLS[seed % QUESTION_STYLE_POOLS.length];
+    const pool = STYLE_POOLS_BY_DIFFICULTY[diffId];
+    const angleStyle = pool[seed % pool.length];
     const recentBlock =
       Array.isArray(body.recentQuestions) && body.recentQuestions.length > 0
-        ? `سؤال‌های تکراری زیر را به هیچ وجه تکرار نکن و موضوع/مثال جدید بساز:\n- ${body.recentQuestions
+        ? `سؤال‌های تکراری زیر را به هیچ وجه تکرار نکن و مثال/عدد جدید بساز:\n- ${body.recentQuestions
             .slice(0, 12)
             .map((q) => q.slice(0, 90))
             .join('\n- ')}`
         : '';
 
     const prompt = `
-دقیقاً ${count} سؤال چهارگزینه‌ای تازه، استاندارد و خلاقانه از منابع بزرگ و کتاب درسی رسمی ایران طراحی کن:
-پایه: ${body.gradeLabel} | درس: ${body.subjectName} | محدوده: ${scopeText}
-سطح: ${difficultyGuidance} | سبک غالب این نوبت: ${angleStyle} | کد تنوع: ${seed % 997}
+دقیقاً ${count} سؤال چهارگزینه‌ای تازه طراحی کن.
+
+⚠️ قفل قطعی درس و فصل (الزامی و بدون استثنا):
+- درس اصلی: «${body.subjectName}»
+- پایه: «${body.gradeLabel}»
+- فصل/درس انتخاب‌شده: «${scopeText}»
 ${topicsContext}
+${excludedBlock}
 ${customFocusText}
+
+سطح دشواری الزامی: ${difficultyGuidance}
+سبک این نوبت: ${angleStyle} | کد تنوع: ${seed % 997}
 ${recentBlock}
 
-قوانین طراحی:
-- کاملاً منطبق بر سرفصل کتاب درسی ${body.gradeLabel} ایران، اما با مثال‌ها، سناریوها و عددهای تازه و متنوع (تکراری و کلیشه‌ای نباشد).
-- سؤالات حس آزمون حرفه‌ای داشته باشند (ترکیبی از مفهومی، موقعیت کاربردی و تله امتحانی ظریف).
-- ۴ گزینه کوتاه، هم‌وزن و بدون حروف الف/ب/ج/د.
-- جایگاه پاسخ درست (correctIndex از ۰ تا ۳) بین سؤالات پخش باشد.
-- hint و quickExplanation هر کدام حداکثر ۱ جمله کوتاه و دقیق باشد.
+قوانین قطعی طراحی:
+1. ۱۰۰٪ سؤالات باید مستقیماً و منحصراً درباره درس «${body.subjectName}» (${body.gradeLabel}) و دقیقاً همین محدوده/مباحث مشخص‌شده («${scopeText}») باشند. طرح حتی یک سؤال از درس‌های دیگر، فصل‌های غیرمجاز بالا یا پایه‌های دیگر اکیداً ممنوع است.
+2. فیلد topicTag هر سؤال باید دقیقاً نام یکی از موضوعات همین درس و فصل باشد.
+3. رعایت سطح دشواری (${diffId === 'easy' ? 'آسان: ساده‌تر از کتاب درسی' : diffId === 'advanced' ? 'سخت: تمام‌عیار در سطح تیزهوشان و سمپاد' : 'متوسط: دقیقاً در حد کتاب درسی'}) در تک‌تک سؤال‌ها الزامی است.
+4. نگارش شفاف و خوانا: متن سؤال‌ها کوتاه، روان و بدون شلوغی باشد. در ریاضی و فرمول‌ها، عبارت‌های ریاضی و اعداد منفی را با فاصله استاندارد و علامت‌های روشن بنویس (مثلاً (-3) + (+7) یا 2x - 5 = 11) و اعداد را در هم نریز تا علامت جمع و تفریق کاملاً خوانا باشد. اگر سؤال شامل چند گزاره یا بخش (الف، ب، ج، د) است، حتماً هر مورد را در یک خط جداگانه با «الف) ...»، «ب) ...»، «ج) ...»، «د) ...» بنویس تا در متن اصلی قاطی نشوند.
+5. ۴ گزینه کوتاه، هم‌وزن و کاملاً بدون پیشوند «الف)»، «ب)»، «ج)»، «د)» یا شماره ۱ تا ۴ (خود سایت برچسب گزینه را می‌گذارد).
+6. جایگاه پاسخ درست (correctIndex از ۰ تا ۳) بین سؤالات پخش باشد.
+7. hint و quickExplanation هر کدام حداکثر ۱ جمله کوتاه و دقیق باشد.
 `;
 
-    const response = await generateFastWithFailover((model, thinkingLevel) =>
-      ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          thinkingConfig: { thinkingLevel },
-          systemInstruction:
-            'طراح خلاق و حرفه‌ای بانک سؤالات آزمون دوره اول متوسطه ایران (هفتم تا نهم). سؤال‌های تازه، رگ‌دار، علمی، دقیق و به فارسی روان بساز.',
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              examTitle: { type: Type.STRING },
-              recommendedMinutes: { type: Type.INTEGER },
-              questions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    question: { type: Type.STRING },
-                    options: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING },
+    const response = await generateFastWithFailover(
+      (model, thinkingLevel) =>
+        ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel },
+            systemInstruction: difficultySystemRule,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                examTitle: { type: Type.STRING },
+                recommendedMinutes: { type: Type.INTEGER },
+                questions: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      question: { type: Type.STRING },
+                      options: {
+                        type: Type.ARRAY,
+                        items: { type: Type.STRING },
+                      },
+                      correctIndex: { type: Type.INTEGER },
+                      topicTag: { type: Type.STRING },
+                      hint: { type: Type.STRING },
+                      quickExplanation: { type: Type.STRING },
                     },
-                    correctIndex: { type: Type.INTEGER },
-                    topicTag: { type: Type.STRING },
-                    hint: { type: Type.STRING },
-                    quickExplanation: { type: Type.STRING },
+                    required: ['question', 'options', 'correctIndex', 'topicTag', 'hint', 'quickExplanation'],
                   },
-                  required: ['question', 'options', 'correctIndex', 'topicTag', 'hint', 'quickExplanation'],
                 },
               },
+              required: ['examTitle', 'recommendedMinutes', 'questions'],
             },
-            required: ['examTitle', 'recommendedMinutes', 'questions'],
           },
-        },
-      })
+        }),
+      ThinkingLevel.LOW
     );
 
     const rawText = (response.text ?? '{}').trim();
@@ -322,11 +447,15 @@ ${recentBlock}
     const sanitizedQuestions = parsed.questions
       .slice(0, count)
       .map((q: Record<string, unknown>, index: number) => {
-        const rawOptions = Array.isArray(q.options) ? q.options.map((o) => String(o)) : [];
-        while (rawOptions.length < 4) {
-          rawOptions.push('هیچ‌کدام');
+        const rawOptions = Array.isArray(q.options) ? q.options.map((o) => String(o).trim()) : [];
+        const optionPrefixRe = /^(?:الف|ب|ج|د|هـ|[1-4]|[۱-۴])\s*[).:\-]\s+/;
+        const prefixedCount = rawOptions.filter((o) => optionPrefixRe.test(o)).length;
+        const cleanedOptions =
+          prefixedCount >= 3 ? rawOptions.map((o) => o.replace(optionPrefixRe, '').trim()) : rawOptions;
+        while (cleanedOptions.length < 4) {
+          cleanedOptions.push('هیچ‌کدام');
         }
-        const options = rawOptions.slice(0, 4) as [string, string, string, string];
+        const options = cleanedOptions.slice(0, 4) as [string, string, string, string];
         const rawIndex = Number(q.correctIndex);
         const correctIndex =
           Number.isInteger(rawIndex) && rawIndex >= 0 && rawIndex <= 3 ? rawIndex : 0;
@@ -534,6 +663,8 @@ async function startServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  await ensureDatabaseSchema();
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Azmona server listening on http://0.0.0.0:${PORT}`);

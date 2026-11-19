@@ -1,11 +1,19 @@
 import crypto from 'crypto';
-import { and, desc, eq } from 'drizzle-orm';
+import { desc, eq, or } from 'drizzle-orm';
 import { db } from './index.ts';
 import { exams, users } from './schema.ts';
 
-const TOKEN_SECRET =
+const PRIMARY_TOKEN_SECRET =
   process.env.SESSION_SECRET ||
-  crypto.createHash('sha256').update(`azmoona-sql-secret-${process.cwd()}`).digest('hex');
+  crypto
+    .createHash('sha256')
+    .update(`azmoona-sql-secret-${process.env.DATABASE_URL || process.cwd()}`)
+    .digest('hex');
+
+const LEGACY_TOKEN_SECRET = crypto
+  .createHash('sha256')
+  .update(`azmoona-sql-secret-${process.cwd()}`)
+  .digest('hex');
 
 export function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
@@ -28,10 +36,19 @@ export function verifyPassword(password: string, storedHash: string): boolean {
 }
 
 export function signLocalAuthToken(uid: string, email: string): string {
-  const exp = Date.now() + 1000 * 60 * 60 * 24 * 30;
+  const exp = Date.now() + 1000 * 60 * 60 * 24 * 180;
   const payload = Buffer.from(JSON.stringify({ uid, email, exp })).toString('base64url');
-  const sig = crypto.createHmac('sha256', TOKEN_SECRET).update(payload).digest('base64url');
+  const sig = crypto
+    .createHmac('sha256', PRIMARY_TOKEN_SECRET)
+    .update(payload)
+    .digest('base64url');
   return `${payload}.${sig}`;
+}
+
+function verifyWithSecret(payload: string, sig: string, secret: string): boolean {
+  const expectedSig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
+  if (sig.length !== expectedSig.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig));
 }
 
 export function verifyLocalAuthToken(token: string): { uid: string; email: string } | null {
@@ -39,14 +56,11 @@ export function verifyLocalAuthToken(token: string): { uid: string; email: strin
     const parts = token.split('.');
     if (parts.length !== 2) return null;
     const [payload, sig] = parts;
-    const expectedSig = crypto
-      .createHmac('sha256', TOKEN_SECRET)
-      .update(payload)
-      .digest('base64url');
-    if (sig.length !== expectedSig.length) return null;
-    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) {
-      return null;
-    }
+    const valid =
+      verifyWithSecret(payload, sig, PRIMARY_TOKEN_SECRET) ||
+      verifyWithSecret(payload, sig, LEGACY_TOKEN_SECRET);
+    if (!valid) return null;
+
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
       uid: string;
       email: string;
@@ -61,18 +75,39 @@ export function verifyLocalAuthToken(token: string): { uid: string; email: strin
   }
 }
 
+async function findUserByUidOrEmail(uid: string, emailRaw?: string) {
+  const email = emailRaw ? normalizeEmail(emailRaw) : null;
+  const rows = email
+    ? await db
+        .select()
+        .from(users)
+        .where(or(eq(users.uid, uid), eq(users.email, email)))
+        .limit(1)
+    : await db.select().from(users).where(eq(users.uid, uid)).limit(1);
+  return rows[0] ?? null;
+}
+
 export async function getOrCreateUser(uid: string, emailRaw: string) {
   const email = normalizeEmail(emailRaw || `${uid}@azmona.local`);
   try {
+    const existing = await findUserByUidOrEmail(uid, email);
+    if (existing) {
+      if (existing.uid !== uid || existing.email !== email) {
+        const updated = await db
+          .update(users)
+          .set({ uid, email })
+          .where(eq(users.id, existing.id))
+          .returning();
+        return updated[0];
+      }
+      return existing;
+    }
+
     const result = await db
       .insert(users)
       .values({
         uid,
         email,
-      })
-      .onConflictDoUpdate({
-        target: users.uid,
-        set: { email },
       })
       .returning();
 
@@ -83,12 +118,30 @@ export async function getOrCreateUser(uid: string, emailRaw: string) {
   }
 }
 
+export async function exchangeFirebaseUserForSession(uid: string, emailRaw: string) {
+  const user = await getOrCreateUser(uid, emailRaw);
+  const token = signLocalAuthToken(user.uid, user.email);
+  return { user: { id: user.uid, email: user.email }, token };
+}
+
 export async function registerEmailUser(emailRaw: string, password: string) {
   const email = normalizeEmail(emailRaw);
   try {
     const existing = await db.select().from(users).where(eq(users.email, email)).limit(1);
     if (existing.length > 0) {
-      throw new Error('این ایمیل قبلاً ثبت‌نام شده است. لطفاً وارد شوید.');
+      const current = existing[0];
+      if (current.passwordHash) {
+        throw new Error('این ایمیل قبلاً ثبت‌نام شده است. لطفاً وارد شوید.');
+      }
+      // User previously signed in via Google without a password; attach password cleanly
+      const updated = await db
+        .update(users)
+        .set({ passwordHash: hashPassword(password) })
+        .where(eq(users.id, current.id))
+        .returning();
+      const user = updated[0];
+      const token = signLocalAuthToken(user.uid, user.email);
+      return { user: { id: user.uid, email: user.email }, token };
     }
 
     const uid = `usr_${crypto.randomUUID()}`;
@@ -118,13 +171,24 @@ export async function loginEmailUser(emailRaw: string, password: string) {
   try {
     const rows = await db.select().from(users).where(eq(users.email, email)).limit(1);
     const user = rows[0];
-    if (!user || !user.passwordHash || !verifyPassword(password, user.passwordHash)) {
+    if (!user) {
+      throw new Error('ایمیل یا رمز عبور نادرست است.');
+    }
+    if (!user.passwordHash) {
+      throw new Error(
+        'این ایمیل با حساب گوگل ساخته شده است. با گوگل وارد شوید یا از بخش «ساخت اکانت» برای آن رمز تعیین کنید.'
+      );
+    }
+    if (!verifyPassword(password, user.passwordHash)) {
       throw new Error('ایمیل یا رمز عبور نادرست است.');
     }
     const token = signLocalAuthToken(user.uid, user.email);
     return { user: { id: user.uid, email: user.email }, token };
   } catch (error) {
-    if (error instanceof Error && error.message.includes('نادرست است')) {
+    if (
+      error instanceof Error &&
+      (error.message.includes('نادرست است') || error.message.includes('گوگل'))
+    ) {
       throw error;
     }
     console.error('Database error in loginEmailUser:', error);
@@ -132,15 +196,20 @@ export async function loginEmailUser(emailRaw: string, password: string) {
   }
 }
 
-export async function getUserExamsFromDb(uid: string): Promise<Array<Record<string, unknown>>> {
+export async function getUserExamsFromDb(
+  uid: string,
+  email?: string
+): Promise<Array<Record<string, unknown>>> {
   try {
+    const user = await findUserByUidOrEmail(uid, email);
+    if (!user) return [];
+
     const rows = await db
       .select({
         payload: exams.payload,
       })
       .from(exams)
-      .innerJoin(users, eq(exams.userId, users.id))
-      .where(eq(users.uid, uid))
+      .where(eq(exams.userId, user.id))
       .orderBy(desc(exams.createdAt))
       .limit(30);
 
@@ -193,11 +262,11 @@ export async function saveUserExamToDb(
   }
 }
 
-export async function clearUserExamsInDb(uid: string): Promise<void> {
+export async function clearUserExamsInDb(uid: string, email?: string): Promise<void> {
   try {
-    const userRows = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
-    if (userRows.length === 0) return;
-    await db.delete(exams).where(and(eq(exams.userId, userRows[0].id)));
+    const user = await findUserByUidOrEmail(uid, email);
+    if (!user) return;
+    await db.delete(exams).where(eq(exams.userId, user.id));
   } catch (error) {
     console.error('Database error in clearUserExamsInDb:', error);
     throw new Error('خطا در پاک کردن کارنامه‌ها.', { cause: error });

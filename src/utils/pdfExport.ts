@@ -8,6 +8,7 @@ import {
   getSubjectById,
   toPersianDigits,
 } from '../data/curriculum';
+import { parseStructuredQuestion, renderExamTextToHtml } from './mathText';
 import type { ExamConfig, ExamHistoryEntry, GeneratedExam } from '../types/exam';
 
 function escapeHtml(text: string): string {
@@ -113,7 +114,7 @@ export async function downloadExamAsPdf(params: {
 
           return `
             <div style="border:1px solid ${border};background:${bg};color:${color};border-radius:6px;padding:7px 10px;font-size:12.5px;">
-              <strong>${OPTION_LETTERS[optIdx]})</strong> ${escapeHtml(opt)}${suffix}
+              <strong>${OPTION_LETTERS[optIdx]})</strong> ${renderExamTextToHtml(opt)}${suffix}
             </div>
           `;
         })
@@ -123,18 +124,47 @@ export async function downloadExamAsPdf(params: {
         result && picked !== q.correctIndex && breakdown
           ? `
             <div style="margin-top:8px;background:#f5f5f5;border-radius:6px;padding:8px 10px;font-size:12px;color:#222222;">
-              <div><strong>دلیل خطا:</strong> ${escapeHtml(breakdown.whyWrongSelected)}</div>
-              <div style="margin-top:4px;"><strong>توضیح:</strong> ${escapeHtml(breakdown.correctConceptExplanation)}</div>
-              <div style="margin-top:4px;"><strong>نکته طلایی:</strong> ${escapeHtml(breakdown.keyTakeaway)}</div>
+              <div><strong>دلیل خطا:</strong> ${renderExamTextToHtml(breakdown.whyWrongSelected)}</div>
+              <div style="margin-top:4px;"><strong>توضیح:</strong> ${renderExamTextToHtml(breakdown.correctConceptExplanation)}</div>
+              <div style="margin-top:4px;"><strong>نکته طلایی:</strong> ${renderExamTextToHtml(breakdown.keyTakeaway)}</div>
             </div>
           `
           : '';
 
+      const parsedQuestion = parseStructuredQuestion(q.question);
+      const questionStemHtml =
+        parsedQuestion.items.length === 0
+          ? `<div style="font-size:13.5px;font-weight:700;margin-bottom:8px;color:#111111;">
+              ${toPersianDigits(num)}. ${renderExamTextToHtml(q.question)}
+            </div>`
+          : `
+            <div style="margin-bottom:8px;color:#111111;">
+              <div style="font-size:13.5px;font-weight:700;margin-bottom:6px;">
+                ${toPersianDigits(num)}. ${parsedQuestion.intro ? renderExamTextToHtml(parsedQuestion.intro) : ''}
+              </div>
+              <div style="background:#f8f8f8;border:1px solid #e3e3e3;border-radius:6px;padding:8px 10px;margin-bottom:6px;">
+                ${parsedQuestion.items
+                  .map(
+                    (item) => `
+                    <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:4px;font-size:12.5px;font-weight:500;color:#1a1a1a;">
+                      <span style="background:#e8e8e8;color:#111111;border-radius:4px;padding:1px 6px;font-size:11.5px;font-weight:800;flex-shrink:0;">${escapeHtml(item.label)}</span>
+                      <span>${renderExamTextToHtml(item.text)}</span>
+                    </div>
+                  `
+                  )
+                  .join('')}
+              </div>
+              ${
+                parsedQuestion.outro
+                  ? `<div style="font-size:13.5px;font-weight:700;margin-top:4px;">${renderExamTextToHtml(parsedQuestion.outro)}</div>`
+                  : ''
+              }
+            </div>
+          `;
+
       return `
         <div style="margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid #e5e5e5;page-break-inside:avoid;">
-          <div style="font-size:13.5px;font-weight:700;margin-bottom:8px;color:#111111;">
-            ${toPersianDigits(num)}. ${escapeHtml(q.question)}
-          </div>
+          ${questionStemHtml}
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
             ${optionsHtml}
           </div>

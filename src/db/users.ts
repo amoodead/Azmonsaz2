@@ -1,7 +1,7 @@
 import crypto from 'crypto';
-import { desc, eq, or } from 'drizzle-orm';
-import { db } from './index.ts';
-import { exams, users } from './schema.ts';
+import { desc, eq, or, sql } from 'drizzle-orm';
+import { OWNER_EMAIL, db, ensureDatabaseSchema, pool } from './index.ts';
+import { exams, ownerNotes, users } from './schema.ts';
 
 const PRIMARY_TOKEN_SECRET =
   process.env.SESSION_SECRET ||
@@ -16,7 +16,11 @@ const LEGACY_TOKEN_SECRET = crypto
   .digest('hex');
 
 export function normalizeEmail(email: string): string {
-  return email.trim().toLowerCase();
+  return email.replace(/[\u200B-\u200F\uFEFF\s]/g, '').toLowerCase();
+}
+
+export function isOwnerEmail(email: string): boolean {
+  return normalizeEmail(email) === OWNER_EMAIL;
 }
 
 export function hashPassword(password: string): string {
@@ -88,19 +92,23 @@ async function findUserByUidOrEmail(uid: string, emailRaw?: string) {
 }
 
 export async function getOrCreateUser(uid: string, emailRaw: string) {
+  await ensureDatabaseSchema();
   const email = normalizeEmail(emailRaw || `${uid}@azmona.local`);
+  const targetRole = isOwnerEmail(email) ? 'owner' : 'student';
   try {
     const existing = await findUserByUidOrEmail(uid, email);
     if (existing) {
-      if (existing.uid !== uid || existing.email !== email) {
-        const updated = await db
-          .update(users)
-          .set({ uid, email })
-          .where(eq(users.id, existing.id))
-          .returning();
-        return updated[0];
-      }
-      return existing;
+      const updated = await db
+        .update(users)
+        .set({
+          uid,
+          email,
+          role: targetRole,
+          lastLoginAt: new Date(),
+        })
+        .where(eq(users.id, existing.id))
+        .returning();
+      return updated[0];
     }
 
     const result = await db
@@ -108,6 +116,8 @@ export async function getOrCreateUser(uid: string, emailRaw: string) {
       .values({
         uid,
         email,
+        role: targetRole,
+        lastLoginAt: new Date(),
       })
       .returning();
 
@@ -121,10 +131,14 @@ export async function getOrCreateUser(uid: string, emailRaw: string) {
 export async function exchangeFirebaseUserForSession(uid: string, emailRaw: string) {
   const user = await getOrCreateUser(uid, emailRaw);
   const token = signLocalAuthToken(user.uid, user.email);
-  return { user: { id: user.uid, email: user.email }, token };
+  return {
+    user: { id: user.uid, email: user.email, isOwner: isOwnerEmail(user.email) },
+    token,
+  };
 }
 
 export async function registerEmailUser(emailRaw: string, password: string) {
+  await ensureDatabaseSchema();
   const email = normalizeEmail(emailRaw);
   try {
     const existing = await db.select().from(users).where(eq(users.email, email)).limit(1);
@@ -136,12 +150,18 @@ export async function registerEmailUser(emailRaw: string, password: string) {
       // User previously signed in via Google without a password; attach password cleanly
       const updated = await db
         .update(users)
-        .set({ passwordHash: hashPassword(password) })
+        .set({
+          passwordHash: hashPassword(password),
+          lastLoginAt: new Date(),
+        })
         .where(eq(users.id, current.id))
         .returning();
       const user = updated[0];
       const token = signLocalAuthToken(user.uid, user.email);
-      return { user: { id: user.uid, email: user.email }, token };
+      return {
+        user: { id: user.uid, email: user.email, isOwner: isOwnerEmail(user.email) },
+        token,
+      };
     }
 
     const uid = `usr_${crypto.randomUUID()}`;
@@ -150,13 +170,18 @@ export async function registerEmailUser(emailRaw: string, password: string) {
       .values({
         uid,
         email,
+        role: isOwnerEmail(email) ? 'owner' : 'student',
         passwordHash: hashPassword(password),
+        lastLoginAt: new Date(),
       })
       .returning();
 
     const user = inserted[0];
     const token = signLocalAuthToken(user.uid, user.email);
-    return { user: { id: user.uid, email: user.email }, token };
+    return {
+      user: { id: user.uid, email: user.email, isOwner: isOwnerEmail(user.email) },
+      token,
+    };
   } catch (error) {
     if (error instanceof Error && error.message.includes('قبلاً ثبت‌نام')) {
       throw error;
@@ -167,6 +192,7 @@ export async function registerEmailUser(emailRaw: string, password: string) {
 }
 
 export async function loginEmailUser(emailRaw: string, password: string) {
+  await ensureDatabaseSchema();
   const email = normalizeEmail(emailRaw);
   try {
     const rows = await db.select().from(users).where(eq(users.email, email)).limit(1);
@@ -182,8 +208,12 @@ export async function loginEmailUser(emailRaw: string, password: string) {
     if (!verifyPassword(password, user.passwordHash)) {
       throw new Error('ایمیل یا رمز عبور نادرست است.');
     }
+    await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
     const token = signLocalAuthToken(user.uid, user.email);
-    return { user: { id: user.uid, email: user.email }, token };
+    return {
+      user: { id: user.uid, email: user.email, isOwner: isOwnerEmail(user.email) },
+      token,
+    };
   } catch (error) {
     if (
       error instanceof Error &&
@@ -194,6 +224,13 @@ export async function loginEmailUser(emailRaw: string, password: string) {
     console.error('Database error in loginEmailUser:', error);
     throw new Error('خطا در ورود به حساب کاربری.', { cause: error });
   }
+}
+
+export async function isOwnerPrincipal(uid: string, emailRaw: string): Promise<boolean> {
+  if (!isOwnerEmail(emailRaw)) return false;
+  await ensureDatabaseSchema();
+  const user = await findUserByUidOrEmail(uid, emailRaw);
+  return Boolean(user && isOwnerEmail(user.email) && user.role === 'owner');
 }
 
 export async function getUserExamsFromDb(
@@ -272,3 +309,128 @@ export async function clearUserExamsInDb(uid: string, email?: string): Promise<v
     throw new Error('خطا در پاک کردن کارنامه‌ها.', { cause: error });
   }
 }
+
+export async function getOwnerDatabaseSnapshot() {
+  await ensureDatabaseSchema();
+
+  const userRows = await pool.query(`
+    SELECT
+      u.id,
+      u.uid,
+      u.email,
+      u.role,
+      (u.password_hash IS NOT NULL) AS has_password,
+      u.last_login_at,
+      u.created_at,
+      COUNT(e.id)::int AS exam_count,
+      COALESCE(ROUND(AVG(e.score_percent))::int, 0) AS avg_score_percent
+    FROM users u
+    LEFT JOIN exams e ON e.user_id = u.id
+    GROUP BY u.id
+    ORDER BY (u.role = 'owner') DESC, u.created_at DESC
+    LIMIT 200;
+  `);
+
+  const examRows = await pool.query(`
+    SELECT
+      e.id,
+      e.exam_key,
+      e.grade,
+      e.subject_id,
+      e.exam_title,
+      e.score_out_of_20,
+      e.score_percent,
+      e.created_at,
+      e.payload,
+      u.email AS owner_email
+    FROM exams e
+    JOIN users u ON u.id = e.user_id
+    ORDER BY e.created_at DESC
+    LIMIT 150;
+  `);
+
+  const noteRows = await db
+    .select()
+    .from(ownerNotes)
+    .orderBy(desc(ownerNotes.createdAt))
+    .limit(100);
+
+  const statsRes = await pool.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM users) AS total_users,
+      (SELECT COUNT(*)::int FROM exams) AS total_exams,
+      (SELECT COALESCE(ROUND(AVG(score_percent))::int, 0) FROM exams) AS avg_score_percent,
+      (SELECT COUNT(*)::int FROM exams WHERE created_at >= NOW() - INTERVAL '24 hours') AS exams_last_24h;
+  `);
+
+  const topSubjectsRes = await pool.query(`
+    SELECT subject_id, COUNT(*)::int AS count
+    FROM exams
+    GROUP BY subject_id
+    ORDER BY count DESC
+    LIMIT 6;
+  `);
+
+  return {
+    stats: statsRes.rows[0] ?? {
+      total_users: 0,
+      total_exams: 0,
+      avg_score_percent: 0,
+      exams_last_24h: 0,
+    },
+    topSubjects: topSubjectsRes.rows,
+    users: userRows.rows,
+    exams: examRows.rows,
+    notes: noteRows,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+export async function createOwnerNote(title: string, content: string, category = 'عمومی') {
+  await ensureDatabaseSchema();
+  const [inserted] = await db
+    .insert(ownerNotes)
+    .values({
+      title: title.trim(),
+      content: content.trim(),
+      category: category.trim() || 'عمومی',
+    })
+    .returning();
+  return inserted;
+}
+
+export async function deleteOwnerNote(noteId: number) {
+  await ensureDatabaseSchema();
+  await db.delete(ownerNotes).where(eq(ownerNotes.id, noteId));
+}
+
+export async function deleteUserAsOwner(userId: number) {
+  await ensureDatabaseSchema();
+  const rows = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+  const target = rows[0];
+  if (!target) return;
+  if (isOwnerEmail(target.email) || target.role === 'owner') {
+    throw new Error('حذف حساب مالک سایت مجاز نیست.');
+  }
+  await db.delete(users).where(eq(users.id, userId));
+}
+
+export async function deleteExamAsOwner(examId: number) {
+  await ensureDatabaseSchema();
+  await db.delete(exams).where(eq(exams.id, examId));
+}
+
+export async function exportOwnerDatabaseBackup() {
+  const snapshot = await getOwnerDatabaseSnapshot();
+  return {
+    app: 'Azmona Private Owner Database Backup',
+    ownerEmail: OWNER_EMAIL,
+    exportedAt: new Date().toISOString(),
+    stats: snapshot.stats,
+    users: snapshot.users,
+    exams: snapshot.exams,
+    notes: snapshot.notes,
+  };
+}
+
+export { sql };

@@ -1,11 +1,12 @@
 import type { NextFunction, Request, Response } from 'express';
 import { adminAuth } from '../lib/firebase-admin.ts';
-import { getOrCreateUser, verifyLocalAuthToken } from '../db/users.ts';
+import { getOrCreateUser, isOwnerEmail, isOwnerPrincipal, verifyLocalAuthToken } from '../db/users.ts';
 
 export interface AuthPrincipal {
   uid: string;
   email: string;
   provider: 'firebase' | 'local';
+  isOwner: boolean;
 }
 
 export interface AuthRequest extends Request {
@@ -49,6 +50,7 @@ export async function resolveAuthPrincipal(req: Request): Promise<AuthPrincipal 
       uid: decoded.uid,
       email,
       provider: 'firebase',
+      isOwner: isOwnerEmail(email),
     };
   } catch {
     // Not a Firebase ID token; verify signed PostgreSQL session token
@@ -60,6 +62,7 @@ export async function resolveAuthPrincipal(req: Request): Promise<AuthPrincipal 
       uid: localUser.uid,
       email: localUser.email,
       provider: 'local',
+      isOwner: isOwnerEmail(localUser.email),
     };
   }
 
@@ -76,5 +79,24 @@ export const requireAuth = async (
     return res.status(401).json({ error: 'نشست کاربری معتبر نیست یا منقضی شده است.' });
   }
   req.authUser = principal;
+  return next();
+};
+
+export const requireOwner = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  const principal = await resolveAuthPrincipal(req);
+  if (!principal) {
+    return res.status(401).json({ error: 'لطفاً ابتدا با حساب مالک وارد شوید.' });
+  }
+  const verifiedOwner = await isOwnerPrincipal(principal.uid, principal.email);
+  if (!verifiedOwner) {
+    return res.status(403).json({
+      error: 'دسترسی غیرمجاز: فقط حساب مالک سایت مجاز به دسترسی به دیتابیس است.',
+    });
+  }
+  req.authUser = { ...principal, isOwner: true };
   return next();
 };

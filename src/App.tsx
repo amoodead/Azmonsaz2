@@ -6,8 +6,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
+  Database,
   Loader2,
   LogOut,
+  Menu,
   Trash2,
   User as UserIcon,
   X,
@@ -20,6 +22,7 @@ import {
   signOut,
 } from 'firebase/auth';
 import { ExamSheet } from './components/ExamSheet';
+import { OwnerDatabaseModal } from './components/OwnerDatabaseModal';
 import { auth, googleAuthProvider } from './lib/firebase';
 import {
   DIFFICULTIES,
@@ -47,6 +50,7 @@ const ACTIVE_SESSION_STORAGE_KEY = 'azmoona_active_session_v1';
 interface AuthUser {
   id: string;
   email: string;
+  isOwner?: boolean;
 }
 
 function loadSavedAuthUser(): AuthUser | null {
@@ -55,7 +59,11 @@ function loadSavedAuthUser(): AuthUser | null {
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<AuthUser>;
     if (parsed && typeof parsed.id === 'string' && typeof parsed.email === 'string') {
-      return { id: parsed.id, email: parsed.email };
+      return {
+        id: parsed.id,
+        email: parsed.email,
+        isOwner: Boolean(parsed.isOwner),
+      };
     }
     return null;
   } catch {
@@ -227,8 +235,10 @@ export default function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
 
-  // Modals: About & Auth
+  // Modals: About, Auth, Owner Database & Mobile Drawer
   const [showAboutModal, setShowAboutModal] = useState(false);
+  const [showOwnerDbModal, setShowOwnerDbModal] = useState(false);
+  const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [authModalMode, setAuthModalMode] = useState<'login' | 'register' | null>(null);
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
@@ -238,18 +248,20 @@ export default function App() {
 
   const wheelRef = useRef<HTMLDivElement | null>(null);
 
-  // Close open modals with Escape key
+  // Close open modals & mobile menu with Escape key
   useEffect(() => {
-    if (!showAboutModal && !authModalMode) return;
+    if (!showAboutModal && !authModalMode && !showOwnerDbModal && !showMobileMenu) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setShowAboutModal(false);
         setAuthModalMode(null);
+        setShowOwnerDbModal(false);
+        setShowMobileMenu(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [showAboutModal, authModalMode]);
+  }, [showAboutModal, authModalMode, showOwnerDbModal]);
 
   // Scroll directly to restored active exam/result after page refresh so it never looks lost
   useEffect(() => {
@@ -456,7 +468,7 @@ export default function App() {
     }
   }, [history, authUser]);
 
-  // Desktop-only 3D drum-roller effect (zero scroll JS attached on mobile/touch devices)
+  // Smooth 3D drum-roller effect on both desktop (wheel damping) and mobile (1:1 finger-locked glide)
   useEffect(() => {
     const wheel = wheelRef.current;
     if (!wheel) return;
@@ -473,46 +485,58 @@ export default function App() {
       }
     };
 
-    if (!desktopMedia.matches || calmMedia.matches) {
+    if (calmMedia.matches) {
       resetStyles();
       return;
     }
 
     let cur = window.scrollY;
     let raf = 0;
+    let lastWidth = window.innerWidth;
+    // Lock viewport height on mobile so browser address-bar show/hide doesn't cause jitter
+    let stableHeight = window.innerHeight;
 
     const roll = () => {
       raf = 0;
-      if (!desktopMedia.matches || calmMedia.matches) {
+      if (calmMedia.matches) {
         resetStyles();
         return;
       }
 
+      const isDesktop = desktopMedia.matches;
       const y = window.scrollY;
-      cur += (y - cur) * 0.14;
-      if (Math.abs(y - cur) < 0.4) cur = y;
 
-      const mid = window.innerHeight / 2;
-      const rad = window.innerHeight * 0.95;
-      const dy = y - cur;
+      if (isDesktop) {
+        cur += (y - cur) * 0.14;
+        if (Math.abs(y - cur) < 0.4) cur = y;
+      } else {
+        // On touch devices, stay 1:1 with native momentum scroll so text never lags or jumps
+        cur = y;
+      }
+
+      const vh = isDesktop ? window.innerHeight : stableHeight;
+      const mid = vh / 2;
+      const rad = vh * (isDesktop ? 0.95 : 1.05);
+      const dy = isDesktop ? y - cur : 0;
 
       for (const p of panels) {
         const h = p.offsetHeight;
         const vt = p.offsetTop - cur;
-        if (h > window.innerHeight * 1.25 || p.classList.contains('tall')) {
+        if (h > vh * 1.25 || p.classList.contains('tall')) {
           p.style.transform = '';
           p.style.transformOrigin = '';
           p.style.opacity = '';
           continue;
         }
         const off = vt + h / 2 - mid;
-        const th = Math.max(-1.45, Math.min(1.45, off / rad));
+        const maxAngle = isDesktop ? 1.45 : 1.15;
+        const th = Math.max(-maxAngle, Math.min(maxAngle, off / rad));
         p.style.transformOrigin = `50% ${mid - vt}px`;
-        p.style.transform = `translateY(${dy}px) perspective(1600px) translateZ(${-rad}px) rotateX(${-th}rad) translateZ(${rad}px) translateY(${-off}px)`;
+        p.style.transform = `translate3d(0, ${dy}px, 0) perspective(1600px) translateZ(${-rad}px) rotateX(${-th}rad) translateZ(${rad}px) translateY(${-off}px)`;
         p.style.opacity = Math.max(0, 1 - Math.pow(Math.abs(th) / 1.3, 2.2)).toFixed(3);
       }
 
-      if (cur !== y) {
+      if (isDesktop && cur !== y) {
         raf = window.requestAnimationFrame(roll);
       }
     };
@@ -521,8 +545,18 @@ export default function App() {
       if (!raf) raf = window.requestAnimationFrame(roll);
     };
 
+    const handleResize = () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      if (w !== lastWidth || Math.abs(h - stableHeight) > 140) {
+        lastWidth = w;
+        stableHeight = h;
+      }
+      kick();
+    };
+
     window.addEventListener('scroll', kick, { passive: true });
-    window.addEventListener('resize', kick);
+    window.addEventListener('resize', handleResize, { passive: true });
     if (document.fonts) {
       document.fonts.ready.then(kick).catch(() => {});
     }
@@ -530,7 +564,7 @@ export default function App() {
 
     return () => {
       window.removeEventListener('scroll', kick);
-      window.removeEventListener('resize', kick);
+      window.removeEventListener('resize', handleResize);
       if (raf) window.cancelAnimationFrame(raf);
       resetStyles();
     };
@@ -611,7 +645,7 @@ export default function App() {
     if (!authModalMode) return;
     setAuthError(null);
 
-    const trimmedEmail = authEmail.trim();
+    const trimmedEmail = authEmail.replace(/[\u200B-\u200F\uFEFF\s]/g, '').toLowerCase();
     if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
       setAuthError('لطفاً یک ایمیل معتبر وارد کنید.');
       return;
@@ -759,6 +793,7 @@ export default function App() {
       // ignore
     }
     saveAuthSession(null, null);
+    setShowOwnerDbModal(false);
     setAuthToken(null);
     setAuthUser(null);
     setAuthSource(null);
@@ -1052,19 +1087,19 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-black text-[#e6e6e6]">
-      {/* Minimalist Top Bar: Corner Book Icon + Brand | About + Login/Register */}
-      <header className="sticky top-0 z-40 border-b border-[#1c1c1c] bg-black md:bg-black/90 md:backdrop-blur-md">
-        <div className="mx-auto flex h-14 max-w-[62rem] items-center justify-between gap-2 px-4 sm:h-16 sm:px-6">
+      {/* Minimalist Top Bar: Transparent White Book Icon + Brand | About + Pill Auth Buttons */}
+      <header className="sticky top-0 z-40 border-b border-[#1c1c1c] bg-black/95 md:bg-black/90 md:backdrop-blur-md">
+        <div className="mx-auto flex h-15 max-w-[62rem] items-center justify-between gap-2 px-3.5 sm:h-16 sm:px-6">
           <a
             href="#top"
-            className="flex items-center gap-2.5 text-white shrink-0"
+            className="flex items-center gap-2 text-white shrink-0"
           >
-            <span className="flex h-11 w-14 items-center justify-center overflow-hidden rounded-lg bg-white p-0 sm:h-9 sm:w-11">
+            <span className="flex h-10 w-13 items-center justify-center overflow-hidden p-0 sm:h-9 sm:w-11">
               <img
-                src="/assets/aistudio/Open_Book_Icon_27f3a556.png"
+                src="/assets/aistudio/White_Open_Book_Icon_10c198c9.png"
                 alt="لوگوی آزمونا"
                 referrerPolicy="no-referrer"
-                className="h-full w-full scale-[1.2] object-contain sm:scale-[1.12]"
+                className="h-full w-full scale-[1.15] object-contain mix-blend-screen"
               />
             </span>
             <div className="leading-none">
@@ -1076,45 +1111,54 @@ export default function App() {
             </div>
           </a>
 
-          <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
+          {/* Desktop Navigation */}
+          <div className="hidden sm:flex items-center gap-2.5 shrink-0">
             <button
               type="button"
               onClick={() => setShowAboutModal(true)}
-              className="min-h-[36px] rounded-[6px] px-2 py-1.5 text-xs font-medium text-[#b5b5b5] transition-colors hover:text-white sm:px-2.5 sm:text-sm whitespace-nowrap"
+              className="min-h-[36px] rounded-full px-3 py-1.5 text-sm font-medium text-[#b5b5b5] transition-colors hover:text-white whitespace-nowrap"
             >
               درباره ما
             </button>
 
             {authUser ? (
-              <div className="flex items-center gap-1.5 sm:gap-2">
+              <div className="flex items-center gap-2">
+                {authUser.isOwner && (
+                  <button
+                    type="button"
+                    onClick={() => setShowOwnerDbModal(true)}
+                    className="inline-flex min-h-[36px] items-center gap-1.5 rounded-full border border-emerald-500/45 bg-emerald-500/15 px-3.5 py-1.5 text-xs font-bold text-emerald-300 transition-colors hover:bg-emerald-500/25 whitespace-nowrap"
+                  >
+                    <Database className="h-3.5 w-3.5 shrink-0" />
+                    <span>دیتابیس</span>
+                  </button>
+                )}
                 <a
                   href="#history-list"
-                  className="inline-flex min-h-[36px] items-center gap-1 rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] px-2 py-1.5 text-[11px] font-medium text-white hover:border-[#666] sm:gap-1.5 sm:px-3 sm:text-xs"
+                  className="inline-flex min-h-[36px] items-center gap-1.5 rounded-full border border-[#2e2e2e] bg-[#0e0e0e] px-3.5 py-1.5 text-xs font-medium text-white hover:border-[#666]"
                 >
                   <UserIcon className="h-3.5 w-3.5 shrink-0" />
-                  <span className="max-w-[80px] truncate sm:max-w-[140px]">
-                    {authUser.email}
-                  </span>
+                  <span className="max-w-[140px] truncate">{authUser.email}</span>
                 </a>
                 <button
                   type="button"
                   onClick={handleLogout}
                   aria-label="خروج از حساب"
-                  className="inline-flex min-h-[36px] items-center gap-1 rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] px-2.5 py-1.5 text-xs font-medium text-[#ccc] hover:border-white hover:text-white whitespace-nowrap"
+                  className="inline-flex min-h-[36px] items-center gap-1 rounded-full border border-[#2e2e2e] bg-[#0e0e0e] px-3.5 py-1.5 text-xs font-medium text-[#ccc] hover:border-white hover:text-white whitespace-nowrap"
                 >
                   <LogOut className="h-3.5 w-3.5" />
                   <span>خروج</span>
                 </button>
               </div>
             ) : (
-              <div className="flex items-center gap-1.5 sm:gap-2">
+              <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => {
                     setAuthError(null);
                     setAuthModalMode('login');
                   }}
-                  className="min-h-[36px] rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] px-2.5 py-1.5 text-xs font-semibold text-white transition-colors hover:border-[#666] sm:px-3 whitespace-nowrap"
+                  className="min-h-[36px] rounded-full border border-[#343434] bg-[#111] px-4 py-1.5 text-xs font-semibold text-white transition-colors hover:border-[#777] whitespace-nowrap"
                 >
                   ورود
                 </button>
@@ -1124,14 +1168,117 @@ export default function App() {
                     setAuthError(null);
                     setAuthModalMode('register');
                   }}
-                  className="min-h-[36px] rounded-[6px] bg-white px-2.5 py-1.5 text-xs font-bold text-black transition-opacity hover:opacity-90 sm:px-3 whitespace-nowrap"
+                  className="min-h-[36px] rounded-full bg-white px-4 py-1.5 text-xs font-bold text-black transition-opacity hover:opacity-90 whitespace-nowrap"
                 >
                   ساخت اکانت
                 </button>
               </div>
             )}
           </div>
+
+          {/* Mobile 3-line Hamburger Button */}
+          <button
+            type="button"
+            aria-label={showMobileMenu ? 'بستن منو' : 'باز کردن منو'}
+            aria-expanded={showMobileMenu}
+            onClick={() => setShowMobileMenu((prev) => !prev)}
+            className="inline-flex h-10 w-10 items-center justify-center rounded-full border border-[#2e2e2e] bg-[#0e0e0e] text-white transition-colors hover:border-[#666] sm:hidden"
+          >
+            {showMobileMenu ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+          </button>
         </div>
+
+        {/* Mobile 3-line Dropdown Menu (About, Login, Sign Up / Account Actions) */}
+        {showMobileMenu && (
+          <>
+            <div
+              onClick={() => setShowMobileMenu(false)}
+              className="fixed inset-0 top-15 z-30 bg-black/70 sm:hidden"
+              aria-hidden="true"
+            />
+            <nav
+              aria-label="منوی موبایل"
+              className="absolute inset-x-0 top-full z-40 border-b border-[#252525] bg-[#0a0a0a] px-4 py-4 shadow-2xl sm:hidden"
+            >
+              <div className="mx-auto flex max-w-[62rem] flex-col gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowMobileMenu(false);
+                    setShowAboutModal(true);
+                  }}
+                  className="flex min-h-[44px] w-full items-center justify-center rounded-full border border-[#2a2a2a] bg-[#121212] px-4 py-2 text-sm font-medium text-[#e6e6e6] transition-colors hover:border-[#555]"
+                >
+                  درباره ما
+                </button>
+
+                {authUser ? (
+                  <>
+                    <a
+                      href="#history-list"
+                      onClick={() => setShowMobileMenu(false)}
+                      className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-full border border-[#2a2a2a] bg-[#121212] px-4 py-2 text-xs font-medium text-white"
+                    >
+                      <UserIcon className="h-4 w-4 shrink-0" />
+                      <span className="truncate">{authUser.email}</span>
+                    </a>
+
+                    {authUser.isOwner && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowMobileMenu(false);
+                          setShowOwnerDbModal(true);
+                        }}
+                        className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-full border border-emerald-500/45 bg-emerald-500/15 px-4 py-2 text-sm font-bold text-emerald-300"
+                      >
+                        <Database className="h-4 w-4 shrink-0" />
+                        <span>دیتابیس</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowMobileMenu(false);
+                        void handleLogout();
+                      }}
+                      className="flex min-h-[44px] w-full items-center justify-center gap-2 rounded-full border border-[#2e2e2e] bg-[#141414] px-4 py-2 text-sm font-semibold text-[#d4d4d4]"
+                    >
+                      <LogOut className="h-4 w-4 shrink-0" />
+                      <span>خروج از حساب</span>
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowMobileMenu(false);
+                        setAuthError(null);
+                        setAuthModalMode('login');
+                      }}
+                      className="flex min-h-[44px] w-full items-center justify-center rounded-full border border-[#343434] bg-[#141414] px-4 py-2 text-sm font-semibold text-white"
+                    >
+                      ورود
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowMobileMenu(false);
+                        setAuthError(null);
+                        setAuthModalMode('register');
+                      }}
+                      className="flex min-h-[44px] w-full items-center justify-center rounded-full bg-white px-4 py-2 text-sm font-bold text-black"
+                    >
+                      ساخت اکانت
+                    </button>
+                  </>
+                )}
+              </div>
+            </nav>
+          </>
+        )}
       </header>
 
       <main ref={wheelRef} className="wheel" id="wheel">
@@ -1141,11 +1288,11 @@ export default function App() {
             <h1 className="hero-title">
               آزمونا<span>هفتم تا نهم</span>
             </h1>
-            <p className="mt-6 max-w-[34rem] text-sm leading-8 text-[#9a9a9a] sm:text-lg">
+            <p className="mt-5 max-w-[34rem] text-base leading-8 text-[#8a8a8a] sm:mt-6 sm:text-lg">
               پایه، درس و فصل کتاب درسی‌ات را انتخاب کن؛ آزمونا در چند ثانیه آزمون چهارگزینه‌ای اختصاصی می‌سازد و در پایان، تک‌تک اشتباهاتت را تحلیل و آموزش می‌دهد.
             </p>
 
-            <div className="mt-8 flex flex-wrap items-center gap-5 sm:mt-10">
+            <div className="mt-8 flex flex-wrap items-center gap-6 sm:mt-10">
               <div className="hidden md:flex items-center gap-3 text-sm text-[#8a8a8a]">
                 <i className="block h-10 w-px bg-gradient-to-b from-white to-transparent" />
                 <span>اسکرول کن</span>
@@ -1205,7 +1352,7 @@ export default function App() {
                   };
                   rafId = window.requestAnimationFrame(step);
                 }}
-                className="min-h-[44px] inline-flex items-center justify-center rounded-[6px] bg-white px-5 py-2.5 text-xs font-extrabold text-black transition-opacity hover:opacity-90 sm:text-sm"
+                className="min-h-[44px] inline-flex items-center justify-center rounded-[6px] bg-white px-5 py-2.5 text-sm font-extrabold text-black transition-opacity hover:opacity-90"
               >
                 شروع ساخت آزمون ↓
               </button>
@@ -1213,32 +1360,32 @@ export default function App() {
           </div>
         </section>
 
-        {/* Panel 2: Features Rows */}
+        {/* Panel 2: Features */}
         <section className="panel">
           <div className="mx-auto w-full max-w-[62rem]">
             <h2 className="panel-heading">مخصوص دانش‌آموز</h2>
             <div className="max-w-[46rem]">
               <div className="flex flex-col gap-1 border-t border-[#2e2e2e] py-4 sm:flex-row sm:gap-6 sm:py-5">
                 <b className="font-display min-w-[9rem] text-xl text-white">سه پایه</b>
-                <span className="text-sm text-[#9a9a9a] sm:text-base">
+                <span className="text-sm leading-7 text-[#a3a3a3] sm:text-base">
                   سؤال‌های چهارگزینه‌ای دقیق بر اساس کتاب‌های رسمی هفتم، هشتم و نهم طراحی می‌شوند.
                 </span>
               </div>
               <div className="flex flex-col gap-1 border-t border-[#2e2e2e] py-4 sm:flex-row sm:gap-6 sm:py-5">
                 <b className="font-display min-w-[9rem] text-xl text-white">انتخاب فصل</b>
-                <span className="text-sm text-[#9a9a9a] sm:text-base">
+                <span className="text-sm leading-7 text-[#a3a3a3] sm:text-base">
                   فقط درس‌ها و فصل‌هایی را که خوانده‌ای انتخاب کن؛ یک درس، چند فصل یا کل کتاب.
                 </span>
               </div>
               <div className="flex flex-col gap-1 border-t border-[#2e2e2e] py-4 sm:flex-row sm:gap-6 sm:py-5">
                 <b className="font-display min-w-[9rem] text-xl text-white">سطح دلخواه</b>
-                <span className="text-sm text-[#9a9a9a] sm:text-base">
+                <span className="text-sm leading-7 text-[#a3a3a3] sm:text-base">
                   از سطح مروری آسان تا چالشی تیزهوشان؛ زمان آزمون را هم خودت تعیین می‌کنی.
                 </span>
               </div>
               <div className="flex flex-col gap-1 border-y border-[#2e2e2e] py-4 sm:flex-row sm:gap-6 sm:py-5">
                 <b className="font-display min-w-[9rem] text-xl text-white">تحلیل و PDF</b>
-                <span className="text-sm text-[#9a9a9a] sm:text-base">
+                <span className="text-sm leading-7 text-[#a3a3a3] sm:text-base">
                   روی صفحه آزمون بده، تحلیل کامل غلط‌ها را ببین و برگه یا کارنامه را به صورت PDF دانلود کن.
                 </span>
               </div>
@@ -1253,15 +1400,21 @@ export default function App() {
             <div className="grid max-w-[60rem] grid-cols-1 border border-[#2e2e2e] sm:grid-cols-3">
               <div className="bg-[#0e0e0e] p-5 sm:p-6">
                 <b className="font-display mb-1 block text-xl text-white">پایه و درس</b>
-                <span className="text-sm text-[#9a9a9a]">هفتم، هشتم یا نهم و درس موردنظر</span>
+                <span className="text-sm text-[#8a8a8a]">
+                  هفتم، هشتم یا نهم و درس موردنظر
+                </span>
               </div>
-              <div className="border-t border-[#2e2e2e] bg-[#0e0e0e] p-5 sm:border-t-0 sm:border-r sm:p-6">
+              <div className="border-t border-[#2e2e2e] bg-[#0e0e0e] p-5 sm:border-r sm:border-t-0 sm:p-6">
                 <b className="font-display mb-1 block text-xl text-white">فصل‌ها</b>
-                <span className="text-sm text-[#9a9a9a]">یک فصل خاص یا چند فصل برای مرور</span>
+                <span className="text-sm text-[#8a8a8a]">
+                  یک فصل خاص یا چند فصل برای مرور
+                </span>
               </div>
-              <div className="border-t border-[#2e2e2e] bg-[#0e0e0e] p-5 sm:border-t-0 sm:border-r sm:p-6">
+              <div className="border-t border-[#2e2e2e] bg-[#0e0e0e] p-5 sm:border-r sm:border-t-0 sm:p-6">
                 <b className="font-display mb-1 block text-xl text-white">آزمون و تحلیل</b>
-                <span className="text-sm text-[#9a9a9a]">حل چهارگزینه‌ای و توضیح کامل غلط‌ها</span>
+                <span className="text-sm text-[#8a8a8a]">
+                  حل چهارگزینه‌ای و توضیح کامل غلط‌ها
+                </span>
               </div>
             </div>
           </div>
@@ -1279,10 +1432,10 @@ export default function App() {
                   <h2 className="panel-heading !mb-0">ساخت آزمون</h2>
                 </div>
 
-                <div className="rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] p-4 sm:p-8">
+                <div className="rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] p-5 sm:p-8">
             {/* Grade */}
-            <div className="mb-5 sm:mb-6">
-              <label className="mb-2 block text-sm text-[#9a9a9a]">پایه تحصیلی</label>
+            <div className="mb-6">
+              <label className="mb-2 block text-sm text-[#8a8a8a]">پایه تحصیلی</label>
               <div className="flex flex-wrap gap-2">
                 {GRADES.map((g) => (
                   <button
@@ -1290,7 +1443,7 @@ export default function App() {
                     type="button"
                     aria-pressed={config.grade === g.id}
                     onClick={() => handleGradeChange(g.id)}
-                    className="chip text-xs sm:text-sm"
+                    className="chip text-sm"
                   >
                     پایه‌ی {g.shortLabel}
                   </button>
@@ -1299,8 +1452,8 @@ export default function App() {
             </div>
 
             {/* Subject */}
-            <div className="mb-5 sm:mb-6">
-              <label className="mb-2 block text-sm text-[#9a9a9a]">نام درس</label>
+            <div className="mb-6">
+              <label className="mb-2 block text-sm text-[#8a8a8a]">نام درس</label>
               <div className="flex flex-wrap gap-2">
                 {SUBJECTS.map((subj) => (
                   <button
@@ -1308,7 +1461,7 @@ export default function App() {
                     type="button"
                     aria-pressed={config.subjectId === subj.id}
                     onClick={() => handleSubjectChange(subj.id)}
-                    className="chip text-xs sm:text-sm"
+                    className="chip text-sm"
                   >
                     {subj.name}
                   </button>
@@ -1317,16 +1470,16 @@ export default function App() {
             </div>
 
             {/* Chapters */}
-            <div className="mb-5 sm:mb-6">
-              <label className="mb-2 block text-sm text-[#9a9a9a]">
-                فصل‌ها (می‌توانی یک یا چند فصل انتخاب کنی)
+            <div className="mb-6">
+              <label className="mb-2 block text-sm text-[#8a8a8a]">
+                فصل‌ها (یک یا چند فصل)
               </label>
               <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
                   aria-pressed={config.allLessons}
                   onClick={handleToggleAllLessons}
-                  className="chip text-xs sm:text-sm"
+                  className="chip text-sm"
                 >
                   همه فصل‌ها
                 </button>
@@ -1338,7 +1491,7 @@ export default function App() {
                       type="button"
                       aria-pressed={pressed}
                       onClick={() => handleToggleLesson(lesson.id)}
-                      className="chip text-xs sm:text-sm"
+                      className="chip text-sm"
                     >
                       درس {toPersianDigits(lesson.number)}: {lesson.title}
                     </button>
@@ -1348,9 +1501,9 @@ export default function App() {
             </div>
 
             {/* Count & Time */}
-            <div className="mb-5 grid grid-cols-1 gap-4 sm:mb-6 sm:grid-cols-2">
+            <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div>
-                <label htmlFor="count-select" className="mb-2 block text-sm text-[#9a9a9a]">
+                <label htmlFor="count-select" className="mb-2 block text-sm text-[#8a8a8a]">
                   تعداد سؤال
                 </label>
                 <select
@@ -1362,7 +1515,7 @@ export default function App() {
                       questionCount: Number(e.target.value),
                     }))
                   }
-                  className="mono-select min-h-[44px] w-full rounded-[6px] border border-[#2e2e2e] bg-[#1a1a1a] px-3 py-2 text-sm text-[#e6e6e6]"
+                  className="mono-select min-h-[44px] w-full rounded-[6px] border border-[#2e2e2e] bg-[#1a1a1a] px-3 py-2 text-base text-[#e6e6e6] sm:text-sm"
                 >
                   <option value={5}>۵ سؤال</option>
                   <option value={10}>۱۰ سؤال</option>
@@ -1372,7 +1525,7 @@ export default function App() {
               </div>
 
               <div>
-                <label htmlFor="time-select" className="mb-2 block text-sm text-[#9a9a9a]">
+                <label htmlFor="time-select" className="mb-2 block text-sm text-[#8a8a8a]">
                   زمان آزمون
                 </label>
                 <select
@@ -1383,7 +1536,7 @@ export default function App() {
                     setTimeSelection(val);
                     setConfig((prev) => ({ ...prev, timedMode: val !== 'none' }));
                   }}
-                  className="mono-select min-h-[44px] w-full rounded-[6px] border border-[#2e2e2e] bg-[#1a1a1a] px-3 py-2 text-sm text-[#e6e6e6]"
+                  className="mono-select min-h-[44px] w-full rounded-[6px] border border-[#2e2e2e] bg-[#1a1a1a] px-3 py-2 text-base text-[#e6e6e6] sm:text-sm"
                 >
                   <option value="auto">خودکار (متناسب با تعداد سؤال)</option>
                   <option value="15">۱۵ دقیقه</option>
@@ -1395,8 +1548,8 @@ export default function App() {
             </div>
 
             {/* Level */}
-            <div className="mb-5 sm:mb-6">
-              <label className="mb-2 block text-sm text-[#9a9a9a]">سطح دشواری</label>
+            <div className="mb-6">
+              <label className="mb-2 block text-sm text-[#8a8a8a]">سطح دشواری</label>
               <div className="flex flex-wrap gap-2">
                 {DIFFICULTIES.map((diff) => (
                   <button
@@ -1404,7 +1557,7 @@ export default function App() {
                     type="button"
                     aria-pressed={config.difficulty === diff.id}
                     onClick={() => setConfig((prev) => ({ ...prev, difficulty: diff.id }))}
-                    className="chip text-xs sm:text-sm"
+                    className="chip text-sm"
                   >
                     {diff.label}
                   </button>
@@ -1414,7 +1567,7 @@ export default function App() {
 
             {/* Custom topic focus */}
             <div className="mb-6">
-              <label htmlFor="custom-topic-input" className="mb-2 block text-sm text-[#9a9a9a]">
+              <label htmlFor="custom-topic-input" className="mb-2 block text-sm text-[#8a8a8a]">
                 تمرکز ویژه (اختیاری)
               </label>
               <input
@@ -1425,7 +1578,7 @@ export default function App() {
                   setConfig((prev) => ({ ...prev, customTopic: e.target.value }))
                 }
                 placeholder="مثلاً: فقط عدد اتمی و ایزوتوپ‌ها یا معادله‌های کسری"
-                className="mono-input min-h-[44px] w-full rounded-[6px] border border-[#2e2e2e] bg-[#1a1a1a] px-3.5 py-2 text-sm text-[#e6e6e6] placeholder:text-[#666]"
+                className="mono-input min-h-[44px] w-full rounded-[6px] border border-[#2e2e2e] bg-[#1a1a1a] px-3.5 py-2 text-base text-[#e6e6e6] placeholder:text-[#666] sm:text-sm"
               />
             </div>
 
@@ -1443,7 +1596,7 @@ export default function App() {
               type="button"
               disabled={isGenerating}
               onClick={() => handleGenerateExam()}
-              className="go flex min-h-[52px] w-full items-center justify-center gap-2 rounded-[6px] bg-white p-3.5 text-base font-extrabold text-black transition-transform active:scale-[0.99] disabled:opacity-60"
+              className="go flex min-h-[48px] w-full items-center justify-center gap-2 rounded-[6px] bg-white p-3.5 text-base font-extrabold text-black transition-opacity hover:opacity-90 disabled:opacity-60"
             >
               {isGenerating ? (
                 <>
@@ -1484,7 +1637,7 @@ export default function App() {
           />
 
           {/* Account / Local History */}
-          <div id="history-list" className="mt-12 border-t border-[#2e2e2e] pt-8">
+          <div id="history-list" className="mt-12 border-t border-[#222] pt-8">
             <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
               <div>
                 <h3 className="font-display text-2xl text-white">
@@ -1568,16 +1721,16 @@ export default function App() {
           onClick={(e) => {
             if (e.target === e.currentTarget) setShowAboutModal(false);
           }}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 sm:p-4 backdrop-blur-xs"
+          className="fixed inset-0 z-50 flex h-[100dvh] items-center justify-center overflow-y-auto overscroll-contain bg-black/85 p-3 sm:p-4 md:backdrop-blur-xs"
         >
-          <div className="w-full max-w-[27rem] max-h-[90dvh] overflow-y-auto rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] p-5 text-right sm:p-6">
-            <div className="flex items-center justify-between border-b border-[#2e2e2e] pb-3">
+          <div className="w-full max-w-[27rem] max-h-[90dvh] overflow-y-auto rounded-2xl border border-[#2a2a2a] bg-[#0e0e0e] p-5 text-right sm:p-6">
+            <div className="flex items-center justify-between border-b border-[#222] pb-3">
               <div className="flex items-center gap-2.5">
-                <span className="flex h-9 w-11 items-center justify-center overflow-hidden rounded-lg bg-white p-0">
+                <span className="flex h-9 w-11 items-center justify-center overflow-hidden p-0">
                   <img
-                    src="/assets/aistudio/Open_Book_Icon_27f3a556.png"
+                    src="/assets/aistudio/White_Open_Book_Icon_10c198c9.png"
                     alt="لوگوی آزمونا"
-                    className="h-full w-full scale-[1.12] object-contain"
+                    className="h-full w-full scale-[1.15] object-contain mix-blend-screen"
                   />
                 </span>
                 <h2 className="font-display text-2xl text-white">درباره آزمونا</h2>
@@ -1586,7 +1739,7 @@ export default function App() {
                 type="button"
                 onClick={() => setShowAboutModal(false)}
                 aria-label="بستن"
-                className="rounded p-1 text-[#8a8a8a] hover:text-white"
+                className="rounded-full p-1.5 text-[#8a8a8a] hover:bg-[#1a1a1a] hover:text-white"
               >
                 <X className="h-5 w-5" />
               </button>
@@ -1604,7 +1757,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setShowAboutModal(false)}
-              className="mt-6 min-h-[42px] w-full rounded-[6px] bg-white py-2 text-sm font-bold text-black hover:opacity-90"
+              className="mt-6 min-h-[44px] w-full rounded-full bg-white py-2 text-sm font-bold text-black hover:opacity-90"
             >
               متوجه شدم
             </button>
@@ -1621,10 +1774,10 @@ export default function App() {
           onClick={(e) => {
             if (e.target === e.currentTarget) setAuthModalMode(null);
           }}
-          className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/80 p-3 pt-10 sm:items-center sm:p-4 backdrop-blur-xs"
+          className="fixed inset-0 z-50 flex h-[100dvh] items-start justify-center overflow-y-auto overscroll-contain bg-black/85 p-3 pt-6 pb-10 sm:items-center sm:p-4 md:backdrop-blur-xs"
         >
-          <div className="my-auto w-full max-w-[27rem] rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] p-5 text-right sm:p-6">
-            <div className="flex items-center justify-between border-b border-[#2e2e2e] pb-3">
+          <div className="my-auto w-full max-w-[27rem] rounded-2xl border border-[#2a2a2a] bg-[#0e0e0e] p-5 text-right sm:p-6">
+            <div className="flex items-center justify-between border-b border-[#222] pb-3">
               <h2 className="font-display text-2xl text-white">
                 {authModalMode === 'register' ? 'ساخت اکانت آزمونا' : 'ورود به حساب'}
               </h2>
@@ -1632,7 +1785,7 @@ export default function App() {
                 type="button"
                 onClick={() => setAuthModalMode(null)}
                 aria-label="بستن"
-                className="rounded p-1 text-[#8a8a8a] hover:text-white"
+                className="rounded-full p-1.5 text-[#8a8a8a] hover:bg-[#1a1a1a] hover:text-white"
               >
                 <X className="h-5 w-5" />
               </button>
@@ -1643,7 +1796,7 @@ export default function App() {
                 type="button"
                 disabled={authLoading}
                 onClick={handleGoogleSignIn}
-                className="flex min-h-[46px] w-full items-center justify-center gap-2.5 rounded-[6px] border border-[#3a3a3a] bg-[#1a1a1a] px-4 py-2 text-xs font-bold text-white transition-colors hover:border-white disabled:opacity-60 sm:text-sm"
+                className="flex min-h-[46px] w-full items-center justify-center gap-2.5 rounded-full border border-[#3a3a3a] bg-[#1a1a1a] px-4 py-2 text-xs font-bold text-white transition-colors hover:border-white disabled:opacity-60 sm:text-sm"
               >
                 <svg
                   className="h-5 w-5 shrink-0"
@@ -1677,14 +1830,14 @@ export default function App() {
               </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-2 rounded-[6px] bg-[#1a1a1a] p-1">
+            <div className="grid grid-cols-2 gap-1.5 rounded-full bg-[#1a1a1a] p-1">
               <button
                 type="button"
                 onClick={() => {
                   setAuthError(null);
                   setAuthModalMode('login');
                 }}
-                className={`min-h-[38px] rounded-[4px] text-xs font-bold transition-colors ${
+                className={`min-h-[38px] rounded-full text-xs font-bold transition-colors ${
                   authModalMode === 'login'
                     ? 'bg-white text-black'
                     : 'text-[#8a8a8a] hover:text-white'
@@ -1698,7 +1851,7 @@ export default function App() {
                   setAuthError(null);
                   setAuthModalMode('register');
                 }}
-                className={`min-h-[38px] rounded-[4px] text-xs font-bold transition-colors ${
+                className={`min-h-[38px] rounded-full text-xs font-bold transition-colors ${
                   authModalMode === 'register'
                     ? 'bg-white text-black'
                     : 'text-[#8a8a8a] hover:text-white'
@@ -1715,17 +1868,18 @@ export default function App() {
                 </label>
                 <input
                   id="auth-email"
+                  name="email"
                   type="email"
                   inputMode="email"
                   autoComplete="email"
                   autoCapitalize="none"
                   autoCorrect="off"
                   spellCheck={false}
-                  dir={authEmail ? 'ltr' : 'rtl'}
+                  dir="ltr"
                   value={authEmail}
                   onChange={(e) => setAuthEmail(e.target.value)}
-                  placeholder="مثلاً student@gmail.com"
-                  className="mono-input min-h-[44px] w-full rounded-[6px] border border-[#2e2e2e] bg-[#1a1a1a] px-3.5 py-2 text-right text-sm text-white placeholder:text-[#666]"
+                  placeholder="student@gmail.com"
+                  className="mono-input min-h-[46px] w-full rounded-xl border border-[#2e2e2e] bg-[#1a1a1a] px-3.5 py-2 text-left text-base text-white placeholder:text-[#666] sm:text-sm"
                 />
               </div>
 
@@ -1735,13 +1889,14 @@ export default function App() {
                 </label>
                 <input
                   id="auth-pass"
+                  name="password"
                   type="password"
                   autoComplete={authModalMode === 'register' ? 'new-password' : 'current-password'}
-                  dir={authPassword ? 'ltr' : 'rtl'}
+                  dir="ltr"
                   value={authPassword}
                   onChange={(e) => setAuthPassword(e.target.value)}
-                  placeholder="رمز عبور را وارد کنید"
-                  className="mono-input min-h-[44px] w-full rounded-[6px] border border-[#2e2e2e] bg-[#1a1a1a] px-3.5 py-2 text-right text-sm text-white placeholder:text-[#666]"
+                  placeholder="••••••"
+                  className="mono-input min-h-[46px] w-full rounded-xl border border-[#2e2e2e] bg-[#1a1a1a] px-3.5 py-2 text-left text-base text-white placeholder:text-[#666] sm:text-sm"
                 />
               </div>
 
@@ -1752,13 +1907,14 @@ export default function App() {
                   </label>
                   <input
                     id="auth-confirm"
+                    name="confirmPassword"
                     type="password"
                     autoComplete="new-password"
-                    dir={authConfirmPassword ? 'ltr' : 'rtl'}
+                    dir="ltr"
                     value={authConfirmPassword}
                     onChange={(e) => setAuthConfirmPassword(e.target.value)}
-                    placeholder="رمز عبور را دوباره وارد کنید"
-                    className="mono-input min-h-[44px] w-full rounded-[6px] border border-[#2e2e2e] bg-[#1a1a1a] px-3.5 py-2 text-right text-sm text-white placeholder:text-[#666]"
+                    placeholder="••••••"
+                    className="mono-input min-h-[46px] w-full rounded-xl border border-[#2e2e2e] bg-[#1a1a1a] px-3.5 py-2 text-left text-base text-white placeholder:text-[#666] sm:text-sm"
                   />
                 </div>
               )}
@@ -1766,7 +1922,7 @@ export default function App() {
               {authError && (
                 <div
                   role="alert"
-                  className="flex items-start gap-2 rounded-[6px] border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-300"
+                  className="flex items-start gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 p-3 text-xs text-rose-300"
                 >
                   <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
                   <span>{authError}</span>
@@ -1776,7 +1932,7 @@ export default function App() {
               <button
                 type="submit"
                 disabled={authLoading}
-                className="flex min-h-[46px] w-full items-center justify-center gap-2 rounded-[6px] bg-white py-2.5 text-sm font-extrabold text-black transition-opacity hover:opacity-90 disabled:opacity-60"
+                className="flex min-h-[48px] w-full items-center justify-center gap-2 rounded-full bg-white py-2.5 text-sm font-extrabold text-black transition-opacity hover:opacity-90 disabled:opacity-60"
               >
                 {authLoading ? (
                   <Loader2 className="h-4 w-4 animate-spin" />
@@ -1789,6 +1945,15 @@ export default function App() {
             </form>
           </div>
         </div>
+      )}
+
+      {/* Owner-exclusive Database Panel (Strictly rendered only for amoodead@gmail.com) */}
+      {authUser?.isOwner && (
+        <OwnerDatabaseModal
+          open={showOwnerDbModal}
+          authToken={authToken}
+          onClose={() => setShowOwnerDbModal(false)}
+        />
       )}
     </div>
   );

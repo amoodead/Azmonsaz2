@@ -3,18 +3,30 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
-import { ensureDatabaseSchema } from './src/db/index.ts';
+import { checkDatabaseHealth, ensureDatabaseSchema } from './src/db/index.ts';
 import {
   clearUserExamsInDb,
+  createOwnerNote,
+  deleteExamAsOwner,
+  deleteOwnerNote,
+  deleteUserAsOwner,
   exchangeFirebaseUserForSession,
+  exportOwnerDatabaseBackup,
+  getOwnerDatabaseSnapshot,
   getUserExamsFromDb,
   loginEmailUser,
+  normalizeEmail,
   registerEmailUser,
   saveUserExamToDb,
   signLocalAuthToken,
 } from './src/db/users.ts';
 import { adminAuth } from './src/lib/firebase-admin.ts';
-import { requireAuth, resolveAuthPrincipal, type AuthRequest } from './src/middleware/auth.ts';
+import {
+  requireAuth,
+  requireOwner,
+  resolveAuthPrincipal,
+  type AuthRequest,
+} from './src/middleware/auth.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,7 +34,16 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '2mb' }));
+
+app.get('/api/health', async (_req, res) => {
+  const dbOk = await checkDatabaseHealth();
+  res.status(dbOk ? 200 : 503).json({
+    ok: dbOk,
+    db: dbOk ? 'connected' : 'unavailable',
+  });
+});
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -160,7 +181,8 @@ app.post('/api/auth/register', async (req, res) => {
       confirmPassword?: string;
     };
 
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+    const cleanedEmail = normalizeEmail(email || '');
+    if (!cleanedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanedEmail)) {
       return res.status(400).json({ error: 'لطفاً یک ایمیل معتبر وارد کنید.' });
     }
     if (!password || password.length < 6) {
@@ -170,7 +192,7 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'رمز عبور و تکرار آن یکسان نیستند.' });
     }
 
-    const result = await registerEmailUser(email, password);
+    const result = await registerEmailUser(cleanedEmail, password);
     setSessionCookie(req, res, result.token);
     res.status(201).json(result);
   } catch (err) {
@@ -181,10 +203,11 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body as { email?: string; password?: string };
-    if (!email || !password) {
+    const cleanedEmail = normalizeEmail(email || '');
+    if (!cleanedEmail || !password) {
       return res.status(400).json({ error: 'ایمیل و رمز عبور را وارد کنید.' });
     }
-    const result = await loginEmailUser(email, password);
+    const result = await loginEmailUser(cleanedEmail, password);
     setSessionCookie(req, res, result.token);
     res.json(result);
   } catch (err) {
@@ -230,7 +253,11 @@ app.get('/api/auth/session', async (req, res) => {
     setSessionCookie(req, res, freshToken);
     res.json({
       authenticated: true,
-      user: { id: principal.uid, email: principal.email },
+      user: {
+        id: principal.uid,
+        email: principal.email,
+        isOwner: Boolean(principal.isOwner),
+      },
       token: freshToken,
     });
   } catch (err) {
@@ -240,7 +267,98 @@ app.get('/api/auth/session', async (req, res) => {
 });
 
 app.get('/api/auth/me', requireAuth, (req: AuthRequest, res) => {
-  res.json({ user: { id: req.authUser!.uid, email: req.authUser!.email } });
+  res.json({
+    user: {
+      id: req.authUser!.uid,
+      email: req.authUser!.email,
+      isOwner: Boolean(req.authUser!.isOwner),
+    },
+  });
+});
+
+// --- Exclusive Owner Database Management Routes (Strictly amoodead@gmail.com only) ---
+
+app.get('/api/owner/database', requireOwner, async (_req: AuthRequest, res) => {
+  try {
+    const snapshot = await getOwnerDatabaseSnapshot();
+    res.json(snapshot);
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'خطا در دریافت اطلاعات دیتابیس مالک.',
+    });
+  }
+});
+
+app.post('/api/owner/notes', requireOwner, async (req: AuthRequest, res) => {
+  try {
+    const { title, content, category } = req.body as {
+      title?: string;
+      content?: string;
+      category?: string;
+    };
+    if (!title?.trim() || !content?.trim()) {
+      return res.status(400).json({ error: 'عنوان و متن یادداشت الزامی است.' });
+    }
+    const note = await createOwnerNote(title, content, category || 'عمومی');
+    res.status(201).json({ note });
+  } catch (err) {
+    res.status(500).json({
+      error: err instanceof Error ? err.message : 'خطا در ثبت یادداشت مالک.',
+    });
+  }
+});
+
+app.delete('/api/owner/notes/:id', requireOwner, async (req: AuthRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'شناسه یادداشت معتبر نیست.' });
+    }
+    await deleteOwnerNote(id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'خطا در حذف یادداشت.' });
+  }
+});
+
+app.delete('/api/owner/users/:id', requireOwner, async (req: AuthRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'شناسه کاربر معتبر نیست.' });
+    }
+    await deleteUserAsOwner(id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'خطا در حذف کاربر.' });
+  }
+});
+
+app.delete('/api/owner/exams/:id', requireOwner, async (req: AuthRequest, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'شناسه آزمون معتبر نیست.' });
+    }
+    await deleteExamAsOwner(id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'خطا در حذف آزمون.' });
+  }
+});
+
+app.get('/api/owner/export', requireOwner, async (_req: AuthRequest, res) => {
+  try {
+    const backup = await exportOwnerDatabaseBackup();
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="azmona-owner-backup-${new Date().toISOString().slice(0, 10)}.json"`
+    );
+    res.send(JSON.stringify(backup, null, 2));
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'خطا در تهیه بکاپ.' });
+  }
 });
 
 app.get('/api/user/exams', requireAuth, async (req: AuthRequest, res) => {
@@ -649,6 +767,23 @@ ${wrongItemsSummary}
 });
 
 async function startServer() {
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'مسیر درخواستی یافت نشد.' });
+  });
+
+  app.use(
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction
+    ) => {
+      console.error('Unhandled server error:', err);
+      if (res.headersSent) return;
+      res.status(500).json({ error: 'خطای داخلی سرور رخ داد. لطفاً دوباره امتحان کنید.' });
+    }
+  );
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

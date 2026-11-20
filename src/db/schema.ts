@@ -5,7 +5,9 @@ export const users = pgTable('users', {
   id: serial('id').primaryKey(),
   uid: text('uid').notNull().unique(),
   email: text('email').notNull().unique(),
+  role: text('role').default('student').notNull(),
   passwordHash: text('password_hash'),
+  lastLoginAt: timestamp('last_login_at'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -21,6 +23,14 @@ export const exams = pgTable('exams', {
   scoreOutOf20: text('score_out_of_20').notNull(),
   scorePercent: integer('score_percent').notNull(),
   payload: jsonb('payload').$type<Record<string, unknown>>().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const ownerNotes = pgTable('owner_notes', {
+  id: serial('id').primaryKey(),
+  title: text('title').notNull(),
+  content: text('content').notNull(),
+  category: text('category').default('عمومی').notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 

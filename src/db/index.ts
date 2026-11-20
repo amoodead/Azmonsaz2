@@ -6,6 +6,10 @@ declare global {
   var _postgresPool: Pool | undefined;
 }
 
+export const OWNER_EMAIL = 'amoodead@gmail.com';
+const OWNER_INITIAL_PASSWORD_HASH =
+  'df60bee8527f3e8e479fc2e9deac3c85:5fc41aea5f1f47cbbdd10f87aa323d0c54d6f687dc9f95f034a3e9506613bb05e237295c384df697dc1649b5fc633b5e1535675cf8e004954e0b6b27375ee114';
+
 export const createPool = () => {
   if (!global._postgresPool) {
     const databaseUrl = process.env.DATABASE_URL?.trim();
@@ -18,8 +22,10 @@ export const createPool = () => {
       global._postgresPool = new Pool({
         connectionString: databaseUrl,
         ssl: needsSsl ? { rejectUnauthorized: false } : undefined,
-        max: 10,
+        max: 20,
+        idleTimeoutMillis: 30000,
         connectionTimeoutMillis: 15000,
+        keepAlive: true,
       });
     } else {
       global._postgresPool = new Pool({
@@ -27,8 +33,10 @@ export const createPool = () => {
         user: process.env.SQL_USER,
         password: process.env.SQL_PASSWORD,
         database: process.env.SQL_DB_NAME,
-        max: 10,
+        max: 20,
+        idleTimeoutMillis: 30000,
         connectionTimeoutMillis: 15000,
+        keepAlive: true,
       });
     }
 
@@ -39,34 +47,91 @@ export const createPool = () => {
   return global._postgresPool;
 };
 
-const pool = createPool();
+export const pool = createPool();
 
 export const db = drizzle(pool, { schema });
 
-export async function ensureDatabaseSchema(): Promise<void> {
+let schemaReadyPromise: Promise<boolean> | null = null;
+
+export async function ensureDatabaseSchema(force = false): Promise<boolean> {
+  if (schemaReadyPromise && !force) {
+    return schemaReadyPromise;
+  }
+
+  schemaReadyPromise = (async () => {
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+          id SERIAL PRIMARY KEY,
+          uid TEXT NOT NULL UNIQUE,
+          email TEXT NOT NULL UNIQUE,
+          role TEXT NOT NULL DEFAULT 'student',
+          password_hash TEXT,
+          last_login_at TIMESTAMP,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'student';
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
+
+        CREATE TABLE IF NOT EXISTS exams (
+          id SERIAL PRIMARY KEY,
+          exam_key TEXT NOT NULL UNIQUE,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          grade TEXT NOT NULL,
+          subject_id TEXT NOT NULL,
+          exam_title TEXT NOT NULL,
+          score_out_of_20 TEXT NOT NULL,
+          score_percent INTEGER NOT NULL,
+          payload JSONB NOT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS owner_notes (
+          id SERIAL PRIMARY KEY,
+          title TEXT NOT NULL,
+          content TEXT NOT NULL,
+          category TEXT NOT NULL DEFAULT 'عمومی',
+          created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+        CREATE INDEX IF NOT EXISTS idx_exams_user_created ON exams (user_id, created_at DESC);
+      `);
+
+      // Guarantee the exclusive owner account exists with owner role and configured credentials
+      await pool.query(
+        `
+        INSERT INTO users (uid, email, role, password_hash)
+        VALUES ($1, $2, 'owner', $3)
+        ON CONFLICT (email) DO UPDATE
+        SET role = 'owner',
+            password_hash = COALESCE(users.password_hash, EXCLUDED.password_hash);
+        `,
+        [`owner_${OWNER_EMAIL}`, OWNER_EMAIL, OWNER_INITIAL_PASSWORD_HASH]
+      );
+
+      // Ensure no other user accidentally holds owner role
+      await pool.query(
+        `UPDATE users SET role = 'student' WHERE LOWER(email) <> $1 AND role = 'owner';`,
+        [OWNER_EMAIL]
+      );
+
+      return true;
+    } catch (error) {
+      console.error('Schema check warning:', error);
+      schemaReadyPromise = null;
+      return false;
+    }
+  })();
+
+  return schemaReadyPromise;
+}
+
+export async function checkDatabaseHealth(): Promise<boolean> {
   try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        uid TEXT NOT NULL UNIQUE,
-        email TEXT NOT NULL UNIQUE,
-        password_hash TEXT,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );
-      CREATE TABLE IF NOT EXISTS exams (
-        id SERIAL PRIMARY KEY,
-        exam_key TEXT NOT NULL UNIQUE,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        grade TEXT NOT NULL,
-        subject_id TEXT NOT NULL,
-        exam_title TEXT NOT NULL,
-        score_out_of_20 TEXT NOT NULL,
-        score_percent INTEGER NOT NULL,
-        payload JSONB NOT NULL,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
-      );
-    `);
-  } catch (error) {
-    console.error('Schema check warning:', error);
+    await pool.query('SELECT 1');
+    return true;
+  } catch {
+    return false;
   }
 }

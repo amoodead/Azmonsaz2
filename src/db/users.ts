@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { desc, eq, or, sql } from 'drizzle-orm';
-import { OWNER_EMAIL, db, ensureDatabaseSchema, pool } from './index.ts';
+import { OWNER_EMAIL, db, ensureDatabaseSchema, pool, withDbRetry } from './index.ts';
 import { exams, ownerNotes, users } from './schema.ts';
 
 const PRIMARY_TOKEN_SECRET =
@@ -22,7 +22,11 @@ const LEGACY_TOKEN_SECRETS = [
 ];
 
 export function normalizeEmail(email: string): string {
-  return email.replace(/[\u200B-\u200F\uFEFF\s]/g, '').toLowerCase();
+  return email
+    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 1776))
+    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 1632))
+    .replace(/[\u200B-\u200F\uFEFF\s]/g, '')
+    .toLowerCase();
 }
 
 export function isOwnerEmail(email: string): boolean {
@@ -102,32 +106,60 @@ export async function getOrCreateUser(uid: string, emailRaw: string) {
   const email = normalizeEmail(emailRaw || `${uid}@azmona.local`);
   const targetRole = isOwnerEmail(email) ? 'owner' : 'student';
   try {
-    const existing = await findUserByUidOrEmail(uid, email);
-    if (existing) {
-      const updated = await db
-        .update(users)
-        .set({
-          uid,
-          email,
-          role: targetRole,
-          lastLoginAt: new Date(),
-        })
-        .where(eq(users.id, existing.id))
-        .returning();
-      return updated[0];
-    }
+    return await withDbRetry(async () => {
+      const existing = await findUserByUidOrEmail(uid, email);
+      if (existing) {
+        const updated = await db
+          .update(users)
+          .set({
+            uid,
+            email,
+            role: targetRole,
+            lastLoginAt: new Date(),
+          })
+          .where(eq(users.id, existing.id))
+          .returning();
+        return updated[0];
+      }
 
-    const result = await db
-      .insert(users)
-      .values({
-        uid,
-        email,
-        role: targetRole,
-        lastLoginAt: new Date(),
-      })
-      .returning();
-
-    return result[0];
+      try {
+        const result = await db
+          .insert(users)
+          .values({
+            uid,
+            email,
+            role: targetRole,
+            lastLoginAt: new Date(),
+          })
+          .returning();
+        return result[0];
+      } catch (insertErr: unknown) {
+        const code =
+          typeof insertErr === 'object' && insertErr !== null && 'code' in insertErr
+            ? String((insertErr as { code?: unknown }).code)
+            : '';
+        if (code === '23505') {
+          // Handle concurrent Google login insert or stale serial sequence cleanly
+          await pool.query(`
+            SELECT setval(
+              pg_get_serial_sequence('users', 'id'),
+              GREATEST(COALESCE((SELECT MAX(id) FROM users), 0), 1),
+              (SELECT COUNT(*) > 0 FROM users)
+            );
+          `);
+          const raced = await findUserByUidOrEmail(uid, email);
+          if (raced) {
+            const updated = await db
+              .update(users)
+              .set({ uid, email, role: targetRole, lastLoginAt: new Date() })
+              .where(eq(users.id, raced.id))
+              .returning();
+            return updated[0];
+          }
+        }
+        throw insertErr;
+      }
+    });
   } catch (error) {
     console.error('Database error in getOrCreateUser:', error);
     throw new Error('خطا در همگام‌سازی حساب کاربری با دیتابیس.', { cause: error });
@@ -147,47 +179,82 @@ export async function registerEmailUser(emailRaw: string, password: string) {
   await ensureDatabaseSchema();
   const email = normalizeEmail(emailRaw);
   try {
-    const existing = await db.select().from(users).where(eq(users.email, email)).limit(1);
-    if (existing.length > 0) {
-      const current = existing[0];
-      if (current.passwordHash) {
-        throw new Error('این ایمیل قبلاً ثبت‌نام شده است. لطفاً وارد شوید.');
+    return await withDbRetry(async () => {
+      const existing = await db.select().from(users).where(eq(users.email, email)).limit(1);
+      if (existing.length > 0) {
+        const current = existing[0];
+        if (current.passwordHash) {
+          throw new Error('این ایمیل قبلاً ثبت‌نام شده است. لطفاً وارد شوید.');
+        }
+        // User previously signed in via Google without a password; attach password cleanly
+        const updated = await db
+          .update(users)
+          .set({
+            passwordHash: hashPassword(password),
+            role: isOwnerEmail(email) ? 'owner' : current.role,
+            lastLoginAt: new Date(),
+          })
+          .where(eq(users.id, current.id))
+          .returning();
+        const user = updated[0];
+        const token = signLocalAuthToken(user.uid, user.email);
+        return {
+          user: { id: user.uid, email: user.email, isOwner: isOwnerEmail(user.email) },
+          token,
+        };
       }
-      // User previously signed in via Google without a password; attach password cleanly
-      const updated = await db
-        .update(users)
-        .set({
-          passwordHash: hashPassword(password),
-          lastLoginAt: new Date(),
-        })
-        .where(eq(users.id, current.id))
-        .returning();
-      const user = updated[0];
+
+      const uid = `usr_${crypto.randomUUID()}`;
+      const doInsert = async () => {
+        const inserted = await db
+          .insert(users)
+          .values({
+            uid,
+            email,
+            role: isOwnerEmail(email) ? 'owner' : 'student',
+            passwordHash: hashPassword(password),
+            lastLoginAt: new Date(),
+          })
+          .returning();
+        return inserted[0];
+      };
+
+      let user;
+      try {
+        user = await doInsert();
+      } catch (insertErr: unknown) {
+        const code =
+          typeof insertErr === 'object' && insertErr !== null && 'code' in insertErr
+            ? String((insertErr as { code?: unknown }).code)
+            : '';
+        const constraint =
+          typeof insertErr === 'object' && insertErr !== null && 'constraint' in insertErr
+            ? String((insertErr as { constraint?: unknown }).constraint)
+            : '';
+        if (code === '23505') {
+          if (constraint.includes('email')) {
+            throw new Error('این ایمیل قبلاً ثبت‌نام شده است. لطفاً وارد شوید.');
+          }
+          // Fix out-of-sync primary key sequence automatically and retry once
+          await pool.query(`
+            SELECT setval(
+              pg_get_serial_sequence('users', 'id'),
+              GREATEST(COALESCE((SELECT MAX(id) FROM users), 0), 1),
+              (SELECT COUNT(*) > 0 FROM users)
+            );
+          `);
+          user = await doInsert();
+        } else {
+          throw insertErr;
+        }
+      }
+
       const token = signLocalAuthToken(user.uid, user.email);
       return {
         user: { id: user.uid, email: user.email, isOwner: isOwnerEmail(user.email) },
         token,
       };
-    }
-
-    const uid = `usr_${crypto.randomUUID()}`;
-    const inserted = await db
-      .insert(users)
-      .values({
-        uid,
-        email,
-        role: isOwnerEmail(email) ? 'owner' : 'student',
-        passwordHash: hashPassword(password),
-        lastLoginAt: new Date(),
-      })
-      .returning();
-
-    const user = inserted[0];
-    const token = signLocalAuthToken(user.uid, user.email);
-    return {
-      user: { id: user.uid, email: user.email, isOwner: isOwnerEmail(user.email) },
-      token,
-    };
+    });
   } catch (error) {
     if (error instanceof Error && error.message.includes('قبلاً ثبت‌نام')) {
       throw error;
@@ -201,25 +268,27 @@ export async function loginEmailUser(emailRaw: string, password: string) {
   await ensureDatabaseSchema();
   const email = normalizeEmail(emailRaw);
   try {
-    const rows = await db.select().from(users).where(eq(users.email, email)).limit(1);
-    const user = rows[0];
-    if (!user) {
-      throw new Error('ایمیل یا رمز عبور نادرست است.');
-    }
-    if (!user.passwordHash) {
-      throw new Error(
-        'این ایمیل با حساب گوگل ساخته شده است. با گوگل وارد شوید یا از بخش «ساخت اکانت» برای آن رمز تعیین کنید.'
-      );
-    }
-    if (!verifyPassword(password, user.passwordHash)) {
-      throw new Error('ایمیل یا رمز عبور نادرست است.');
-    }
-    await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
-    const token = signLocalAuthToken(user.uid, user.email);
-    return {
-      user: { id: user.uid, email: user.email, isOwner: isOwnerEmail(user.email) },
-      token,
-    };
+    return await withDbRetry(async () => {
+      const rows = await db.select().from(users).where(eq(users.email, email)).limit(1);
+      const user = rows[0];
+      if (!user) {
+        throw new Error('ایمیل یا رمز عبور نادرست است.');
+      }
+      if (!user.passwordHash) {
+        throw new Error(
+          'این ایمیل با حساب گوگل ساخته شده است. با گوگل وارد شوید یا از بخش «ساخت اکانت» برای آن رمز تعیین کنید.'
+        );
+      }
+      if (!verifyPassword(password, user.passwordHash)) {
+        throw new Error('ایمیل یا رمز عبور نادرست است.');
+      }
+      await db.update(users).set({ lastLoginAt: new Date() }).where(eq(users.id, user.id));
+      const token = signLocalAuthToken(user.uid, user.email);
+      return {
+        user: { id: user.uid, email: user.email, isOwner: isOwnerEmail(user.email) },
+        token,
+      };
+    });
   } catch (error) {
     if (
       error instanceof Error &&

@@ -250,6 +250,10 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
 
   const wheelRef = useRef<HTMLDivElement | null>(null);
+  const googleExchangeRef = useRef<{
+    token: string;
+    promise: Promise<{ token: string; user: AuthUser }>;
+  } | null>(null);
 
   // Close open modals & mobile menu with Escape key
   useEffect(() => {
@@ -311,27 +315,49 @@ export default function App() {
   ]);
 
   // Exchange a Firebase ID token for a 180-day persistent server session + HttpOnly cookie
+  // Deduplicates parallel calls from handleGoogleSignIn + onAuthStateChanged and retries transient errors
   const exchangeGoogleSession = useCallback(
     async (idToken: string, fallbackUser: AuthUser): Promise<{ token: string; user: AuthUser }> => {
-      try {
-        const res = await fetch('/api/auth/google', {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ idToken }),
-        });
-        if (res.ok) {
-          const data = (await res.json()) as { token?: string; user?: AuthUser };
-          if (data.token && data.user?.email) {
-            saveAuthSession(data.token, data.user);
-            return { token: data.token, user: data.user };
+      if (googleExchangeRef.current && googleExchangeRef.current.token === idToken) {
+        return googleExchangeRef.current.promise;
+      }
+
+      const task = (async () => {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            const res = await fetch('/api/auth/google', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ idToken }),
+            });
+            if (res.ok) {
+              const data = (await res.json()) as { token?: string; user?: AuthUser };
+              if (data.token && data.user?.email) {
+                saveAuthSession(data.token, data.user);
+                return { token: data.token, user: data.user };
+              }
+            }
+            if (res.status < 500) {
+              break;
+            }
+          } catch {
+            // Retry once on transient network / Render cold-start error
+          }
+          if (attempt === 0) {
+            await new Promise((resolve) => setTimeout(resolve, 450));
           }
         }
-      } catch {
-        // Ignore transient network hiccup; keep Firebase token & cached user
-      }
-      saveAuthSession(idToken, fallbackUser);
-      return { token: idToken, user: fallbackUser };
+        saveAuthSession(idToken, fallbackUser);
+        return { token: idToken, user: fallbackUser };
+      })().finally(() => {
+        if (googleExchangeRef.current?.token === idToken) {
+          googleExchangeRef.current = null;
+        }
+      });
+
+      googleExchangeRef.current = { token: idToken, promise: task };
+      return task;
     },
     []
   );
@@ -676,7 +702,11 @@ export default function App() {
     if (!authModalMode) return;
     setAuthError(null);
 
-    const trimmedEmail = authEmail.replace(/[\u200B-\u200F\uFEFF\s]/g, '').toLowerCase();
+    const trimmedEmail = authEmail
+      .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 1776))
+      .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 1632))
+      .replace(/[\u200B-\u200F\uFEFF\s]/g, '')
+      .toLowerCase();
     if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
       setAuthError('لطفاً یک ایمیل معتبر وارد کنید.');
       return;

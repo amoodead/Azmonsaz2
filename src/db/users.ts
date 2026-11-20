@@ -7,13 +7,19 @@ const PRIMARY_TOKEN_SECRET =
   process.env.SESSION_SECRET ||
   crypto
     .createHash('sha256')
-    .update(`azmoona-sql-secret-${process.env.DATABASE_URL || process.cwd()}`)
+    .update(`azmoona-sql-secret-${process.env.DATABASE_URL || 'seraphic-citron-vq7xb'}`)
     .digest('hex');
 
-const LEGACY_TOKEN_SECRET = crypto
-  .createHash('sha256')
-  .update(`azmoona-sql-secret-${process.cwd()}`)
-  .digest('hex');
+const LEGACY_TOKEN_SECRETS = [
+  crypto
+    .createHash('sha256')
+    .update(`azmoona-sql-secret-${process.env.DATABASE_URL || process.cwd()}`)
+    .digest('hex'),
+  crypto
+    .createHash('sha256')
+    .update(`azmoona-sql-secret-${process.cwd()}`)
+    .digest('hex'),
+];
 
 export function normalizeEmail(email: string): string {
   return email.replace(/[\u200B-\u200F\uFEFF\s]/g, '').toLowerCase();
@@ -62,7 +68,7 @@ export function verifyLocalAuthToken(token: string): { uid: string; email: strin
     const [payload, sig] = parts;
     const valid =
       verifyWithSecret(payload, sig, PRIMARY_TOKEN_SECRET) ||
-      verifyWithSecret(payload, sig, LEGACY_TOKEN_SECRET);
+      LEGACY_TOKEN_SECRETS.some((secret) => verifyWithSecret(payload, sig, secret));
     if (!valid) return null;
 
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {

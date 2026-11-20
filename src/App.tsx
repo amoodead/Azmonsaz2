@@ -164,7 +164,10 @@ async function safeParseJson(res: Response): Promise<Record<string, unknown>> {
 
 function mapFirebaseAuthError(code: string): string {
   if (code === 'auth/unauthorized-domain') {
-    return 'این دامنه در بخش دامنه‌های مجاز (Authorized domains) تنظیمات Firebase ثبت نشده است.';
+    const host = typeof window !== 'undefined' ? window.location.hostname : '';
+    return host
+      ? `دامنه فعلی (${host}) در بخش دامنه‌های مجاز (Authorized domains) تنظیمات Firebase ثبت نشده است. آن را در کنسول Firebase اضافه کنید یا از ورود با ایمیل و رمز عبور استفاده نمایید.`
+      : 'این دامنه در بخش دامنه‌های مجاز (Authorized domains) تنظیمات Firebase ثبت نشده است.';
   }
   if (code === 'auth/operation-not-allowed') {
     return 'ورود با گوگل در کنسول Firebase فعال نشده است. از ایمیل و رمز عبور استفاده کنید.';
@@ -327,7 +330,7 @@ export default function App() {
       } catch {
         // Ignore transient network hiccup; keep Firebase token & cached user
       }
-      saveAuthSession(null, fallbackUser);
+      saveAuthSession(idToken, fallbackUser);
       return { token: idToken, user: fallbackUser };
     },
     []
@@ -353,9 +356,11 @@ export default function App() {
       try {
         const idToken = await fbUser.getIdToken();
         if (!mounted) return;
+        const cachedUser = loadSavedAuthUser();
         const fallbackUser: AuthUser = {
           id: fbUser.uid,
-          email: fbUser.email || 'کاربر گوگل',
+          email: fbUser.email || cachedUser?.email || 'کاربر گوگل',
+          isOwner: cachedUser?.email === fbUser.email ? cachedUser?.isOwner : undefined,
         };
         const session = await exchangeGoogleSession(idToken, fallbackUser);
         if (!mounted) return;
@@ -388,7 +393,7 @@ export default function App() {
   }, [exchangeGoogleSession]);
 
   // Restore saved account session once on mount via Bearer token OR persistent HttpOnly cookie
-  // Never wipes local login on offline/cold-start network errors — only when server explicitly reports invalid session
+  // Waits for Firebase IndexedDB hydration before ever clearing a logged-in state on refresh
   useEffect(() => {
     let cancelled = false;
 
@@ -417,12 +422,38 @@ export default function App() {
         if (cancelled) return;
 
         if (!sessionData.authenticated || !sessionData.user) {
-          if (!auth.currentUser) {
-            setAuthToken(null);
-            setAuthUser(null);
-            setAuthSource(null);
-            saveAuthSession(null, null);
+          // Wait for Firebase Auth IndexedDB hydration so Google accounts never vanish briefly on refresh
+          try {
+            await auth.authStateReady();
+          } catch {
+            // ignore
           }
+          if (cancelled) return;
+
+          if (auth.currentUser) {
+            try {
+              const idToken = await auth.currentUser.getIdToken();
+              if (cancelled) return;
+              const cached = loadSavedAuthUser();
+              const session = await exchangeGoogleSession(idToken, {
+                id: auth.currentUser.uid,
+                email: auth.currentUser.email || cached?.email || 'کاربر گوگل',
+                isOwner: cached?.email === auth.currentUser.email ? cached?.isOwner : undefined,
+              });
+              if (cancelled) return;
+              setAuthSource(session.token === idToken ? 'firebase' : 'local');
+              setAuthToken(session.token);
+              setAuthUser(session.user);
+            } catch {
+              // keep cached session if token refresh fails temporarily offline
+            }
+            return;
+          }
+
+          setAuthToken(null);
+          setAuthUser(null);
+          setAuthSource(null);
+          saveAuthSession(null, null);
           return;
         }
 

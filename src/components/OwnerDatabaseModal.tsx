@@ -110,6 +110,17 @@ export const OwnerDatabaseModal: React.FC<OwnerDatabaseModalProps> = ({
     return headers;
   }, [authToken]);
 
+  const safeModalParseJson = async (res: Response): Promise<Record<string, unknown>> => {
+    try {
+      const text = await res.text();
+      const trimmed = text.trim();
+      if (!trimmed || trimmed.startsWith('<')) return {};
+      return JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  };
+
   const fetchSnapshot = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -118,11 +129,15 @@ export const OwnerDatabaseModal: React.FC<OwnerDatabaseModalProps> = ({
         credentials: 'include',
         headers: buildHeaders(),
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'خطا در دریافت اطلاعات دیتابیس مالک.');
+      const data = await safeModalParseJson(res);
+      if (!res.ok || !data.users) {
+        throw new Error(
+          typeof data.error === 'string' && data.error
+            ? data.error
+            : 'خطا در دریافت اطلاعات دیتابیس مالک.'
+        );
       }
-      setSnapshot(data as OwnerSnapshot);
+      setSnapshot(data as unknown as OwnerSnapshot);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'خطا در اتصال به دیتابیس.');
     } finally {
@@ -167,8 +182,8 @@ export const OwnerDatabaseModal: React.FC<OwnerDatabaseModalProps> = ({
         credentials: 'include',
         headers: buildHeaders(),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'حذف کاربر ناموفق بود.');
+      const data = await safeModalParseJson(res);
+      if (!res.ok) throw new Error((typeof data.error === 'string' && data.error) || 'حذف کاربر ناموفق بود.');
       await fetchSnapshot();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'خطا در حذف کاربر.');
@@ -186,8 +201,8 @@ export const OwnerDatabaseModal: React.FC<OwnerDatabaseModalProps> = ({
         credentials: 'include',
         headers: buildHeaders(),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'حذف آزمون ناموفق بود.');
+      const data = await safeModalParseJson(res);
+      if (!res.ok) throw new Error((typeof data.error === 'string' && data.error) || 'حذف آزمون ناموفق بود.');
       await fetchSnapshot();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'خطا در حذف آزمون.');
@@ -215,8 +230,8 @@ export const OwnerDatabaseModal: React.FC<OwnerDatabaseModalProps> = ({
           category: noteCategory,
         }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'ثبت یادداشت ناموفق بود.');
+      const data = await safeModalParseJson(res);
+      if (!res.ok) throw new Error((typeof data.error === 'string' && data.error) || 'ثبت یادداشت ناموفق بود.');
       setNoteTitle('');
       setNoteContent('');
       await fetchSnapshot();

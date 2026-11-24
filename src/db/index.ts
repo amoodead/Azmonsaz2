@@ -10,9 +10,23 @@ export const OWNER_EMAIL = 'amoodead@gmail.com';
 const OWNER_INITIAL_PASSWORD_HASH =
   'df60bee8527f3e8e479fc2e9deac3c85:5fc41aea5f1f47cbbdd10f87aa323d0c54d6f687dc9f95f034a3e9506613bb05e237295c384df697dc1649b5fc633b5e1535675cf8e004954e0b6b27375ee114';
 
+function resolveDatabaseUrl(): string {
+  const raw =
+    process.env.DATABASE_URL ||
+    process.env.INTERNAL_DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.POSTGRESQL_URL ||
+    '';
+  return raw.trim().replace(/^['"]|['"]$/g, '').trim();
+}
+
+export function isDatabaseConfigured(): boolean {
+  return Boolean(resolveDatabaseUrl() || process.env.SQL_HOST?.trim() || process.env.PGHOST?.trim());
+}
+
 export const createPool = () => {
   if (!global._postgresPool) {
-    const databaseUrl = process.env.DATABASE_URL?.trim();
+    const databaseUrl = resolveDatabaseUrl();
     if (databaseUrl) {
       const needsSsl =
         databaseUrl.includes('sslmode=require') ||
@@ -27,16 +41,25 @@ export const createPool = () => {
         connectionTimeoutMillis: 15000,
         keepAlive: true,
       });
-    } else {
+    } else if (process.env.SQL_HOST?.trim() || process.env.PGHOST?.trim()) {
       global._postgresPool = new Pool({
-        host: process.env.SQL_HOST,
-        user: process.env.SQL_USER,
-        password: process.env.SQL_PASSWORD,
-        database: process.env.SQL_DB_NAME,
+        host: process.env.SQL_HOST?.trim() || process.env.PGHOST?.trim(),
+        user: process.env.SQL_USER?.trim() || process.env.PGUSER?.trim(),
+        password: process.env.SQL_PASSWORD || process.env.PGPASSWORD,
+        database: process.env.SQL_DB_NAME?.trim() || process.env.PGDATABASE?.trim(),
         max: 20,
         idleTimeoutMillis: 30000,
         connectionTimeoutMillis: 15000,
         keepAlive: true,
+      });
+    } else {
+      console.error(
+        'DATABASE CONFIGURATION ERROR: Neither DATABASE_URL nor SQL_HOST is set in environment variables.'
+      );
+      global._postgresPool = new Pool({
+        host: '127.0.0.1',
+        port: 5432,
+        connectionTimeoutMillis: 3000,
       });
     }
 

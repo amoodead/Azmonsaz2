@@ -1,6 +1,13 @@
 import crypto from 'crypto';
 import { desc, eq, or, sql } from 'drizzle-orm';
-import { OWNER_EMAIL, db, ensureDatabaseSchema, pool, withDbRetry } from './index.ts';
+import {
+  OWNER_EMAIL,
+  db,
+  ensureDatabaseSchema,
+  isDatabaseConfigured,
+  pool,
+  withDbRetry,
+} from './index.ts';
 import { exams, ownerNotes, users } from './schema.ts';
 
 const PRIMARY_TOKEN_SECRET =
@@ -102,6 +109,9 @@ async function findUserByUidOrEmail(uid: string, emailRaw?: string) {
 }
 
 export async function getOrCreateUser(uid: string, emailRaw: string) {
+  if (!isDatabaseConfigured()) {
+    throw new Error('تنظیمات اتصال دیتابیس (DATABASE_URL) روی سرور وارد نشده است.');
+  }
   await ensureDatabaseSchema();
   const email = normalizeEmail(emailRaw || `${uid}@azmona.local`);
   const targetRole = isOwnerEmail(email) ? 'owner' : 'student';
@@ -176,6 +186,9 @@ export async function exchangeFirebaseUserForSession(uid: string, emailRaw: stri
 }
 
 export async function registerEmailUser(emailRaw: string, password: string) {
+  if (!isDatabaseConfigured()) {
+    throw new Error('تنظیمات اتصال دیتابیس (DATABASE_URL) روی سرور وارد نشده است.');
+  }
   await ensureDatabaseSchema();
   const email = normalizeEmail(emailRaw);
   try {
@@ -256,7 +269,10 @@ export async function registerEmailUser(emailRaw: string, password: string) {
       };
     });
   } catch (error) {
-    if (error instanceof Error && error.message.includes('قبلاً ثبت‌نام')) {
+    if (
+      error instanceof Error &&
+      (error.message.includes('قبلاً ثبت‌نام') || error.message.includes('DATABASE_URL'))
+    ) {
       throw error;
     }
     console.error('Database error in registerEmailUser:', error);
@@ -265,6 +281,9 @@ export async function registerEmailUser(emailRaw: string, password: string) {
 }
 
 export async function loginEmailUser(emailRaw: string, password: string) {
+  if (!isDatabaseConfigured()) {
+    throw new Error('تنظیمات اتصال دیتابیس (DATABASE_URL) روی سرور وارد نشده است.');
+  }
   await ensureDatabaseSchema();
   const email = normalizeEmail(emailRaw);
   try {

@@ -152,14 +152,67 @@ function writeActiveSessionSync(state: PersistedSessionState | null): void {
   }
 }
 
-async function safeParseJson(res: Response): Promise<Record<string, unknown>> {
+interface ParsedApiResponse {
+  data: Record<string, unknown>;
+  isHtmlOrNonJson: boolean;
+}
+
+async function readApiResponse(res: Response): Promise<ParsedApiResponse> {
   try {
     const text = await res.text();
-    if (!text) return {};
-    return JSON.parse(text) as Record<string, unknown>;
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return { data: {}, isHtmlOrNonJson: false };
+    }
+    const lower = trimmed.toLowerCase();
+    if (lower.startsWith('<!doctype') || lower.startsWith('<html') || lower.startsWith('<')) {
+      return { data: {}, isHtmlOrNonJson: true };
+    }
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === 'object') {
+      return { data: parsed as Record<string, unknown>, isHtmlOrNonJson: false };
+    }
+    return { data: {}, isHtmlOrNonJson: true };
   } catch {
-    return {};
+    return { data: {}, isHtmlOrNonJson: true };
   }
+}
+
+async function safeParseJson(res: Response): Promise<Record<string, unknown>> {
+  const { data } = await readApiResponse(res);
+  return data;
+}
+
+function formatClientApiError(rawError: unknown, fallbackMessage: string, status?: number): string {
+  const raw = rawError instanceof Error ? rawError.message : typeof rawError === 'string' ? rawError : '';
+  const lower = raw.toLowerCase();
+
+  if (
+    lower.includes('503') ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand') ||
+    lower.includes('overloaded') ||
+    status === 503
+  ) {
+    return 'سرور هوش مصنوعی گوگل در این لحظه با ترافیک بالا و شلوغی موقت روبه‌رو است. لطفاً چند ثانیه صبر کرده و دوباره امتحان کنید.';
+  }
+  if (lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota') || status === 429) {
+    return 'تعداد درخواست‌ها در این دقیقه زیاد بوده است. لطفاً چند ثانیه صبر کرده و دوباره بزنید.';
+  }
+  if (
+    lower.includes('unexpected token') ||
+    lower.includes('not valid json') ||
+    lower.includes('<!doctype') ||
+    status === 502 ||
+    status === 504
+  ) {
+    return 'سرور موقتاً در حال پاسخ‌دهی یا بارگذاری مجدد است. لطفاً چند ثانیه دیگر دوباره امتحان کنید.';
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    return fallbackMessage;
+  }
+  return trimmed;
 }
 
 function mapFirebaseAuthError(code: string): string {
@@ -268,7 +321,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [showAboutModal, authModalMode, showOwnerDbModal]);
+  }, [showAboutModal, authModalMode, showOwnerDbModal, showMobileMenu]);
 
   // Scroll directly to restored active exam/result after page refresh so it never looks lost
   useEffect(() => {
@@ -937,19 +990,35 @@ export default function App() {
           variationSeed: Date.now(),
         };
 
-        const response = await fetch('/api/exam/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
+        const postGenerate = () =>
+          fetch('/api/exam/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
 
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || 'خطا در تولید سؤالات آزمون.');
+        let response = await postGenerate();
+        let parsedRes = await readApiResponse(response);
+
+        // Retry once transparently if proxy/host returned an HTML cold-start / 502 / 504 page
+        if (parsedRes.isHtmlOrNonJson || response.status === 502 || response.status === 504) {
+          await new Promise((resolve) => setTimeout(resolve, 1400));
+          response = await postGenerate();
+          parsedRes = await readApiResponse(response);
+        }
+
+        if (!response.ok || parsedRes.isHtmlOrNonJson) {
+          throw new Error(
+            formatClientApiError(
+              parsedRes.data.error,
+              'خطا در تولید سؤالات آزمون. لطفاً دوباره امتحان کنید.',
+              response.status
+            )
+          );
         }
 
         const newKey = `exam-${Date.now()}`;
-        const generated = data as GeneratedExam;
+        const generated = parsedRes.data as unknown as GeneratedExam;
         writeActiveSessionSync({
           activeExam: generated,
           activeConfig: targetConfig,
@@ -968,7 +1037,7 @@ export default function App() {
         }, 80);
       } catch (err) {
         setGenerateError(
-          err instanceof Error ? err.message : 'مشکلی در ارتباط با سرور پیش آمد.'
+          formatClientApiError(err, 'مشکلی در ارتباط با سرور پیش آمد. لطفاً دوباره امتحان کنید.')
         );
       } finally {
         setIsGenerating(false);
@@ -1012,30 +1081,47 @@ export default function App() {
           })
           .filter((item): item is NonNullable<typeof item> => item !== null);
 
-        const response = await fetch('/api/exam/analyze', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            gradeLabel: getGradeLabel(entry.config.grade),
-            subjectName: subject.name,
-            lessonScope,
-            totalQuestions: entry.questions.length,
-            correctCount: entry.correctCount,
-            wrongCount: entry.wrongCount,
-            unansweredCount: entry.unansweredCount,
-            scorePercent: entry.scorePercent,
-            timeSpentSeconds: entry.timeSpentSeconds,
-            correctTopics: Array.from(new Set(correctTopics)),
-            wrongItems,
-          }),
+        const analyzePayload = JSON.stringify({
+          gradeLabel: getGradeLabel(entry.config.grade),
+          subjectName: subject.name,
+          lessonScope,
+          totalQuestions: entry.questions.length,
+          correctCount: entry.correctCount,
+          wrongCount: entry.wrongCount,
+          unansweredCount: entry.unansweredCount,
+          scorePercent: entry.scorePercent,
+          timeSpentSeconds: entry.timeSpentSeconds,
+          correctTopics: Array.from(new Set(correctTopics)),
+          wrongItems,
         });
 
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || 'خطا در تحلیل اشتباهات آزمون.');
+        const postAnalyze = () =>
+          fetch('/api/exam/analyze', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: analyzePayload,
+          });
+
+        let response = await postAnalyze();
+        let parsedRes = await readApiResponse(response);
+
+        if (parsedRes.isHtmlOrNonJson || response.status === 502 || response.status === 504) {
+          await new Promise((resolve) => setTimeout(resolve, 1400));
+          response = await postAnalyze();
+          parsedRes = await readApiResponse(response);
         }
 
-        const analysis = data as ExamAnalysis;
+        if (!response.ok || parsedRes.isHtmlOrNonJson) {
+          throw new Error(
+            formatClientApiError(
+              parsedRes.data.error,
+              'خطا در تحلیل اشتباهات آزمون. لطفاً دوباره امتحان کنید.',
+              response.status
+            )
+          );
+        }
+
+        const analysis = parsedRes.data as unknown as ExamAnalysis;
         const updatedEntry: ExamHistoryEntry = { ...entry, analysis };
 
         setCurrentResult(updatedEntry);
@@ -1045,7 +1131,7 @@ export default function App() {
         void persistExamToAccount(updatedEntry);
       } catch (err) {
         setAnalysisError(
-          err instanceof Error ? err.message : 'تحلیل هوشمند با خطا مواجه شد.'
+          formatClientApiError(err, 'تحلیل هوشمند با خطا مواجه شد. لطفاً دوباره امتحان کنید.')
         );
       } finally {
         setIsAnalyzing(false);
@@ -1153,18 +1239,23 @@ export default function App() {
         <div className="mx-auto flex h-15 max-w-[62rem] items-center justify-between gap-2 px-3.5 sm:h-16 sm:px-6">
           <a
             href="#top"
+            aria-label="صفحه اصلی آزمونا | Azmona"
             className="flex items-center gap-2 text-white shrink-0"
           >
             <span className="flex h-10 w-13 items-center justify-center overflow-hidden p-0 sm:h-9 sm:w-11">
               <img
                 src="/assets/aistudio/White_Open_Book_Icon_10c198c9.png"
-                alt="لوگوی آزمونا"
+                alt="لوگوی آزمونا | Azmona — آزمون‌ساز آنلاین"
+                width={44}
+                height={36}
+                decoding="async"
+                fetchPriority="high"
                 referrerPolicy="no-referrer"
                 className="h-full w-full scale-[1.15] object-contain mix-blend-screen"
               />
             </span>
             <div className="leading-none">
-              <span className="font-display block text-xl tracking-tight sm:text-2xl">آزمونا</span>
+              <span className="font-display block text-xl tracking-tight sm:text-2xl">آزمونا | Azmona</span>
               <span className="mt-1 inline-flex items-center gap-1 text-[10px] font-medium text-[#9a9a9a]">
                 <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
                 <span>نسخه آزمایشی · Demo</span>
@@ -1349,8 +1440,8 @@ export default function App() {
             <h1 className="hero-title">
               آزمونا<span>هفتم تا نهم</span>
             </h1>
-            <p className="mt-5 max-w-[34rem] text-base leading-8 text-[#8a8a8a] sm:mt-6 sm:text-lg">
-              پایه، درس و فصل کتاب درسی‌ات را انتخاب کن؛ آزمونا در چند ثانیه آزمون چهارگزینه‌ای اختصاصی می‌سازد و در پایان، تک‌تک اشتباهاتت را تحلیل و آموزش می‌دهد.
+            <p className="mt-5 max-w-[36rem] text-base leading-8 text-[#8a8a8a] sm:mt-6 sm:text-lg">
+              آزمونا (Azmoona) یک سامانه آزمون‌ساز آنلاین برای طراحی، ساخت و برگزاری آزمون تستی پایه هفتم، هشتم و نهم است. پایه، درس و فصل کتاب درسی‌ات را انتخاب کن تا امتحان اینترنتی اختصاصی ساخته شود و در پایان، تک‌تک اشتباهاتت همراه با کارنامه و خروجی PDF تحلیل شود.
             </p>
 
             <div className="mt-8 flex flex-wrap items-center gap-6 sm:mt-10">
@@ -1422,32 +1513,32 @@ export default function App() {
         </section>
 
         {/* Panel 2: Features */}
-        <section className="panel">
+        <section className="panel" id="features">
           <div className="mx-auto w-full max-w-[62rem]">
             <h2 className="panel-heading">مخصوص دانش‌آموز</h2>
             <div className="max-w-[46rem]">
               <div className="flex flex-col gap-1 border-t border-[#2e2e2e] py-4 sm:flex-row sm:gap-6 sm:py-5">
-                <b className="font-display min-w-[9rem] text-xl text-white">سه پایه</b>
+                <h3 className="font-display min-w-[9rem] text-xl text-white">سه پایه</h3>
                 <span className="text-sm leading-7 text-[#a3a3a3] sm:text-base">
-                  سؤال‌های چهارگزینه‌ای دقیق بر اساس کتاب‌های رسمی هفتم، هشتم و نهم طراحی می‌شوند.
+                  طراحی آزمون و سؤال‌های چهارگزینه‌ای استاندارد بر اساس کتاب‌های رسمی هفتم، هشتم و نهم.
                 </span>
               </div>
               <div className="flex flex-col gap-1 border-t border-[#2e2e2e] py-4 sm:flex-row sm:gap-6 sm:py-5">
-                <b className="font-display min-w-[9rem] text-xl text-white">انتخاب فصل</b>
+                <h3 className="font-display min-w-[9rem] text-xl text-white">انتخاب فصل</h3>
                 <span className="text-sm leading-7 text-[#a3a3a3] sm:text-base">
-                  فقط درس‌ها و فصل‌هایی را که خوانده‌ای انتخاب کن؛ یک درس، چند فصل یا کل کتاب.
+                  برای ساخت آزمون آنلاین فقط درس‌ها و فصل‌هایی را که خوانده‌ای انتخاب کن؛ یک درس، چند فصل یا کل کتاب.
                 </span>
               </div>
               <div className="flex flex-col gap-1 border-t border-[#2e2e2e] py-4 sm:flex-row sm:gap-6 sm:py-5">
-                <b className="font-display min-w-[9rem] text-xl text-white">سطح دلخواه</b>
+                <h3 className="font-display min-w-[9rem] text-xl text-white">سطح دلخواه</h3>
                 <span className="text-sm leading-7 text-[#a3a3a3] sm:text-base">
-                  از سطح مروری آسان تا چالشی تیزهوشان؛ زمان آزمون را هم خودت تعیین می‌کنی.
+                  برگزاری آزمون اینترنتی از سطح مروری آسان تا چالشی تیزهوشان؛ زمان امتحان آنلاین را هم خودت تعیین می‌کنی.
                 </span>
               </div>
               <div className="flex flex-col gap-1 border-y border-[#2e2e2e] py-4 sm:flex-row sm:gap-6 sm:py-5">
-                <b className="font-display min-w-[9rem] text-xl text-white">تحلیل و PDF</b>
+                <h3 className="font-display min-w-[9rem] text-xl text-white">تحلیل و PDF</h3>
                 <span className="text-sm leading-7 text-[#a3a3a3] sm:text-base">
-                  روی صفحه آزمون بده، تحلیل کامل غلط‌ها را ببین و برگه یا کارنامه را به صورت PDF دانلود کن.
+                  در سامانه آزمون آنلاین آزمونا شرکت کن، تحلیل کامل غلط‌ها را ببین و برگه امتحان یا کارنامه را به صورت PDF دانلود کن.
                 </span>
               </div>
             </div>
@@ -1455,26 +1546,26 @@ export default function App() {
         </section>
 
         {/* Panel 3: 3 Steps */}
-        <section className="panel">
+        <section className="panel" id="steps">
           <div className="mx-auto w-full max-w-[62rem]">
             <h2 className="panel-heading">سه قدم تا آزمون</h2>
             <div className="grid max-w-[60rem] grid-cols-1 border border-[#2e2e2e] sm:grid-cols-3">
               <div className="bg-[#0e0e0e] p-5 sm:p-6">
-                <b className="font-display mb-1 block text-xl text-white">پایه و درس</b>
+                <h3 className="font-display mb-1 block text-xl text-white">پایه و درس</h3>
                 <span className="text-sm text-[#8a8a8a]">
-                  هفتم، هشتم یا نهم و درس موردنظر
+                  انتخاب پایه هفتم، هشتم یا نهم و درس موردنظر برای ساخت امتحان آنلاین
                 </span>
               </div>
               <div className="border-t border-[#2e2e2e] bg-[#0e0e0e] p-5 sm:border-r sm:border-t-0 sm:p-6">
-                <b className="font-display mb-1 block text-xl text-white">فصل‌ها</b>
+                <h3 className="font-display mb-1 block text-xl text-white">فصل‌ها</h3>
                 <span className="text-sm text-[#8a8a8a]">
-                  یک فصل خاص یا چند فصل برای مرور
+                  یک فصل خاص یا چند فصل کتاب برای طراحی آزمون تستی و مرور دقیق
                 </span>
               </div>
               <div className="border-t border-[#2e2e2e] bg-[#0e0e0e] p-5 sm:border-r sm:border-t-0 sm:p-6">
-                <b className="font-display mb-1 block text-xl text-white">آزمون و تحلیل</b>
+                <h3 className="font-display mb-1 block text-xl text-white">آزمون و تحلیل</h3>
                 <span className="text-sm text-[#8a8a8a]">
-                  حل چهارگزینه‌ای و توضیح کامل غلط‌ها
+                  برگزاری آزمون چهارگزینه‌ای، کارنامه و توضیح کامل پاسخ‌های غلط
                 </span>
               </div>
             </div>
@@ -1490,7 +1581,7 @@ export default function App() {
             {!activeExam && !currentResult && (
               <>
                 <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-                  <h2 className="panel-heading !mb-0">ساخت آزمون</h2>
+                  <h2 className="panel-heading !mb-0">ساخت آزمون آنلاین</h2>
                 </div>
 
                 <div className="rounded-[6px] border border-[#2e2e2e] bg-[#0e0e0e] p-5 sm:p-8">
@@ -1767,9 +1858,15 @@ export default function App() {
       </main>
 
       <footer className="border-t border-[#1c1c1c] px-4 py-8 text-center text-xs text-[#8a8a8a] sm:px-6">
-        <div className="mx-auto flex max-w-[62rem] flex-col items-center justify-between gap-2 sm:flex-row">
-          <span>© ۲۰۲۶ آزمونا (Azmona). تمامی حقوق محفوظ است.</span>
-          <span className="text-[#666]">آزمون‌ساز هوشمند دوره اول متوسطه (هفتم تا نهم)</span>
+        <div className="mx-auto flex max-w-[62rem] flex-col items-center justify-between gap-3 sm:flex-row">
+          <span>© ۲۰۲۶ آزمونا | Azmona (Azmoona). تمامی حقوق محفوظ است.</span>
+          <nav aria-label="پیوندهای سریع" className="flex flex-wrap items-center justify-center gap-4 text-[#8a8a8a]">
+            <a href="#top" className="hover:text-white transition-colors">صفحه اصلی</a>
+            <a href="#features" className="hover:text-white transition-colors">امکانات</a>
+            <a href="#steps" className="hover:text-white transition-colors">مراحل آزمون</a>
+            <a href="#builder" className="hover:text-white transition-colors">ساخت آزمون آنلاین</a>
+          </nav>
+          <span className="text-[#666]">سامانه آزمون‌ساز آنلاین هفتم تا نهم</span>
         </div>
       </footer>
 
@@ -1790,11 +1887,15 @@ export default function App() {
                 <span className="flex h-9 w-11 items-center justify-center overflow-hidden p-0">
                   <img
                     src="/assets/aistudio/White_Open_Book_Icon_10c198c9.png"
-                    alt="لوگوی آزمونا"
+                    alt="لوگوی آزمونا | Azmona"
+                    width={44}
+                    height={36}
+                    loading="lazy"
+                    decoding="async"
                     className="h-full w-full scale-[1.15] object-contain mix-blend-screen"
                   />
                 </span>
-                <h2 className="font-display text-2xl text-white">درباره آزمونا</h2>
+                <h2 className="font-display text-2xl text-white">درباره آزمونا | Azmona</h2>
               </div>
               <button
                 type="button"
@@ -1808,10 +1909,10 @@ export default function App() {
 
             <div className="mt-4 space-y-3 text-sm leading-7 text-[#bdbdbd]">
               <p>
-                <strong className="text-white">آزمونا (Azmona)</strong> یک دستیار هوشمند آموزش برای دانش‌آموزان پایه‌های <strong className="text-white">هفتم، هشتم و نهم</strong> است.
+                <strong className="text-white">آزمونا | Azmona (Azmoona)</strong> یک سامانه آنلاین ساخت، طراحی و برگزاری آزمون تستی برای دانش‌آموزان پایه‌های <strong className="text-white">هفتم، هشتم و نهم</strong> است.
               </p>
               <p>
-                کافی است پایه، درس و فصل دقیق کتاب درسی‌ات را انتخاب کنی تا سؤالات چهارگزینه‌ای استاندارد طراحی شود. در پایان هم تمام پاسخ‌های اشتباهت به زبان ساده تحلیل می‌شوند و می‌توانی کارنامه یا برگه آزمون را با فرمت PDF دانلود کنی.
+                کافی است پایه، درس و فصل دقیق کتاب درسی‌ات را انتخاب کنی تا آزمون اینترنتی استاندارد طراحی شود. در پایان هم تمام پاسخ‌های اشتباهت به زبان ساده تحلیل می‌شوند و می‌توانی کارنامه یا برگه امتحان را با فرمت PDF دانلود و در حساب کاربری‌ات مدیریت کنی.
               </p>
             </div>
 

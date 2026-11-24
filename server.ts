@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
@@ -35,6 +36,23 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 app.set('trust proxy', 1);
+
+// Canonical 301 redirect for alternate versions of azmoonaa.ir (www / HTTP -> https://azmoonaa.ir)
+app.use((req, res, next) => {
+  const host = (req.headers.host || '').split(':')[0].toLowerCase();
+  const proto = String(req.headers['x-forwarded-proto'] || req.protocol || '').toLowerCase();
+  if (host === 'www.azmoonaa.ir' || (host === 'azmoonaa.ir' && proto === 'http')) {
+    return res.redirect(301, `https://azmoonaa.ir${req.originalUrl}`);
+  }
+  next();
+});
+
+// Prevent search engines from indexing internal JSON API routes
+app.use('/api', (_req, res, next) => {
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  next();
+});
+
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/api/health', async (_req, res) => {
@@ -60,8 +78,24 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
+function extractGeminiErrorText(error: unknown): string {
+  if (error instanceof Error) {
+    const anyErr = error as Error & { status?: number | string; code?: number | string };
+    const extra = [anyErr.status, anyErr.code].filter(Boolean).join(' ');
+    return extra ? `${extra} ${error.message}` : error.message;
+  }
+  if (error && typeof error === 'object') {
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+  return String(error);
+}
+
 function isRateLimitOrTransient(error: unknown): boolean {
-  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  const msg = extractGeminiErrorText(error).toLowerCase();
   return (
     msg.includes('429') ||
     msg.includes('resource_exhausted') ||
@@ -69,47 +103,94 @@ function isRateLimitOrTransient(error: unknown): boolean {
     msg.includes('rate') ||
     msg.includes('503') ||
     msg.includes('unavailable') ||
+    msg.includes('high demand') ||
+    msg.includes('spike') ||
     msg.includes('overloaded') ||
     msg.includes('500') ||
-    msg.includes('timeout')
+    msg.includes('internal') ||
+    msg.includes('timeout') ||
+    msg.includes('etimedout') ||
+    msg.includes('econnreset') ||
+    msg.includes('fetch failed')
   );
 }
 
+const modelCooldownUntil = new Map<string, number>();
+
+function isModelInCooldown(model: string): boolean {
+  const until = modelCooldownUntil.get(model);
+  if (!until) return false;
+  if (Date.now() >= until) {
+    modelCooldownUntil.delete(model);
+    return false;
+  }
+  return true;
+}
+
+function parseModelJson<T = Record<string, unknown>>(rawText: string): T {
+  const cleaned = rawText
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  const firstBrace = cleaned.indexOf('{');
+  const lastBrace = cleaned.lastIndexOf('}');
+  const jsonCandidate =
+    firstBrace !== -1 && lastBrace > firstBrace ? cleaned.slice(firstBrace, lastBrace + 1) : cleaned;
+  return JSON.parse(jsonCandidate) as T;
+}
+
 /**
- * Fast model execution with automatic multi-model failover:
- * Primary: gemini-3.1-flash-lite (ThinkingLevel.MINIMAL)
- * Fallback: gemini-4-hydrogen (ThinkingLevel.LOW)
+ * Fast model execution with automatic multi-model failover, congestion cooldown, and jittered backoff:
+ * - Primary / Fallback pool: gemini-3.1-flash-lite & gemini-4-hydrogen (ThinkingLevel.LOW - MINIMAL is unsupported on hydrogen)
  */
 async function generateFastWithFailover<T>(
   runner: (model: string, thinkingLevel: ThinkingLevel) => Promise<T>,
   primaryThinking: ThinkingLevel = ThinkingLevel.MINIMAL
 ): Promise<T> {
-  const attempts: Array<{ model: string; thinking: ThinkingLevel; delayBeforeMs: number }> = [
-    { model: 'gemini-3.1-flash-lite', thinking: primaryThinking, delayBeforeMs: 0 },
-    { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW, delayBeforeMs: 350 },
-    { model: 'gemini-3.1-flash-lite', thinking: primaryThinking, delayBeforeMs: 900 },
-  ];
+  const lite = { model: 'gemini-3.1-flash-lite', thinking: primaryThinking };
+  const hydrogen = { model: 'gemini-4-hydrogen', thinking: ThinkingLevel.LOW };
+
+  // Prefer whichever model is NOT currently experiencing a 503/429 spike
+  const startWithHydrogen =
+    isModelInCooldown('gemini-3.1-flash-lite') && !isModelInCooldown('gemini-4-hydrogen');
+
+  const sequence = startWithHydrogen
+    ? [hydrogen, lite, hydrogen, lite, hydrogen]
+    : [lite, hydrogen, lite, hydrogen, lite];
+
+  const delays = [0, 750, 1750, 3100, 4800];
 
   let lastError: unknown;
-  for (const step of attempts) {
-    if (step.delayBeforeMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, step.delayBeforeMs));
+  for (let i = 0; i < sequence.length; i++) {
+    const step = sequence[i];
+    const baseDelayMs = delays[i] ?? 0;
+    if (baseDelayMs > 0) {
+      const jitter = Math.floor(Math.random() * 250);
+      await new Promise((resolve) => setTimeout(resolve, baseDelayMs + jitter));
     }
     try {
-      return await runner(step.model, step.thinking);
+      const result = await runner(step.model, step.thinking);
+      modelCooldownUntil.delete(step.model);
+      return result;
     } catch (err) {
       lastError = err;
       if (!isRateLimitOrTransient(err)) {
         throw err;
       }
+      modelCooldownUntil.set(step.model, Date.now() + 25_000);
+      console.warn(
+        `[Gemini] transient failure on ${step.model} (attempt ${i + 1}/${sequence.length}):`,
+        extractGeminiErrorText(err).slice(0, 180)
+      );
     }
   }
   throw lastError;
 }
 
 function mapGeminiError(error: unknown): { status: number; message: string } {
-  const raw = error instanceof Error ? error.message : String(error);
-  const lower = raw.toLowerCase();
+  const raw = error instanceof Error ? error.message : extractGeminiErrorText(error);
+  const lower = extractGeminiErrorText(error).toLowerCase();
 
   if (
     lower.includes('api_key_invalid') ||
@@ -128,15 +209,54 @@ function mapGeminiError(error: unknown): { status: number; message: string } {
       message: 'تعداد درخواست‌ها در این دقیقه زیاد بوده است. لطفاً چند ثانیه صبر کرده و دوباره بزنید.',
     };
   }
+  if (
+    lower.includes('503') ||
+    lower.includes('unavailable') ||
+    lower.includes('high demand') ||
+    lower.includes('spike') ||
+    lower.includes('overloaded')
+  ) {
+    return {
+      status: 503,
+      message:
+        'سرور هوش مصنوعی گوگل در این لحظه با ترافیک بالا و شلوغی موقت روبه‌رو است. لطفاً چند ثانیه صبر کرده و دوباره امتحان کنید.',
+    };
+  }
+  if (
+    lower.includes('timeout') ||
+    lower.includes('etimedout') ||
+    lower.includes('econnreset') ||
+    lower.includes('fetch failed') ||
+    lower.includes('500') ||
+    lower.includes('internal')
+  ) {
+    return {
+      status: 503,
+      message:
+        'ارتباط با سرور هوش مصنوعی موقتاً با اختلال یا تأخیر روبه‌رو شد. لطفاً چند لحظه دیگر دوباره امتحان کنید.',
+    };
+  }
   if (lower.includes('not_found') || lower.includes('404')) {
     return {
       status: 502,
       message: 'مدل هوش مصنوعی در دسترس نیست. لطفاً تنظیمات سرور را بررسی کنید.',
     };
   }
+  if (lower.includes('unexpected token') || lower.includes('is not valid json') || error instanceof SyntaxError) {
+    return {
+      status: 502,
+      message: 'پاسخ دریافتی از هوش مصنوعی کامل نبود. لطفاً دوباره روی دکمه بزنید.',
+    };
+  }
+
+  const trimmed = raw.trim();
+  const isRawJson = trimmed.startsWith('{') || trimmed.startsWith('[');
   return {
     status: 500,
-    message: raw || 'خطای غیرمنتظره در ارتباط با سرور هوش مصنوعی رخ داد.',
+    message:
+      !trimmed || isRawJson
+        ? 'خطای غیرمنتظره در ارتباط با سرور هوش مصنوعی رخ داد. لطفاً دوباره امتحان کنید.'
+        : trimmed,
   };
 }
 
@@ -556,7 +676,11 @@ ${recentBlock}
     );
 
     const rawText = (response.text ?? '{}').trim();
-    const parsed = JSON.parse(rawText);
+    const parsed = parseModelJson<{
+      examTitle?: unknown;
+      recommendedMinutes?: unknown;
+      questions?: Array<Record<string, unknown>>;
+    }>(rawText);
 
     if (!parsed || !Array.isArray(parsed.questions) || parsed.questions.length === 0) {
       throw new Error('ساختار سؤالات دریافتی کامل نبود. لطفاً دوباره امتحان کنید.');
@@ -741,7 +865,13 @@ ${wrongItemsSummary}
     );
 
     const rawText = (response.text ?? '{}').trim();
-    const parsed = JSON.parse(rawText);
+    const parsed = parseModelJson<{
+      overallSummary?: unknown;
+      strengthTopics?: unknown[];
+      weakTopics?: unknown[];
+      studyRecommendations?: unknown[];
+      wrongBreakdowns?: unknown[];
+    }>(rawText);
 
     const resultPayload = {
       overallSummary: String(parsed.overallSummary || ''),
@@ -783,6 +913,29 @@ async function startServer() {
       res.status(500).json({ error: 'خطای داخلی سرور رخ داد. لطفاً دوباره امتحان کنید.' });
     }
   );
+
+  const resolveStaticAsset = (filename: string): string | null => {
+    const candidates =
+      process.env.NODE_ENV === 'production'
+        ? [path.resolve(__dirname, 'dist', filename), path.resolve(__dirname, 'public', filename)]
+        : [path.resolve(__dirname, 'public', filename), path.resolve(__dirname, 'dist', filename)];
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) return candidate;
+    }
+    return null;
+  };
+
+  app.get('/robots.txt', (_req, res, next) => {
+    const filePath = resolveStaticAsset('robots.txt');
+    if (!filePath) return next();
+    res.type('text/plain; charset=utf-8').sendFile(filePath);
+  });
+
+  app.get('/sitemap.xml', (_req, res, next) => {
+    const filePath = resolveStaticAsset('sitemap.xml');
+    if (!filePath) return next();
+    res.type('application/xml; charset=utf-8').sendFile(filePath);
+  });
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
